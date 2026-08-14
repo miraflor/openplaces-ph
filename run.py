@@ -6,7 +6,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from ph_poi.cli import main
+from openplaces_ph.cli import main
 
 if __name__ == "__main__":
     main()

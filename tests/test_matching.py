@@ -1,8 +1,8 @@
 import numpy as np
 
-from ph_poi.finalize import UnionFindMask
-from ph_poi.matching import accept_pair
-from ph_poi.util import normalize_name
+from openplaces_ph.finalize import UnionFindMask
+from openplaces_ph.matching import accept_pair
+from openplaces_ph.util import normalize_name
 
 
 def test_name_normalization():

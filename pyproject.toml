@@ -3,12 +3,12 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ph-poi-triangulation"
-version = "0.5.0"
-description = "Crash-resumable, old-laptop-friendly triangulation of Philippine POIs from Foursquare, Overture, and OSM."
+name = "openplaces-ph"
+version = "0.1.0"
+description = "Open, provenance-aware Philippine places and establishment data built by triangulating multiple open geospatial sources."
 requires-python = ">=3.11"
 license = {text = "MIT"}
-authors = [{name = "Project contributors"}]
+authors = [{name = "OpenPlaces PH contributors"}]
 dependencies = [
     "duckdb>=1.4,<2",
     "numpy",
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ph-poi = "ph_poi.cli:main"
+openplaces = "openplaces_ph.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

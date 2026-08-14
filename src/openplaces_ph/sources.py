@@ -1,6 +1,6 @@
 """Acquire and normalize the three POI sources.
 
-Design goals for an old laptop
+Design goals for an resource-constrained laptop
 ------------------------------
 1. Never download a worldwide dataset when a Philippine subset can be queried.
 2. Keep remote work in 1-degree blocks, so a failed request loses one block.
@@ -61,6 +61,40 @@ OSM_KEYS = (
     "emergency",
     "public_transport",
 )
+
+# SPDX-style identifiers used in the normalized observation layer.  These are
+# data licenses, not the MIT license covering OpenPlaces PH's source code.
+FSQ_LICENSE = "Apache-2.0"
+OSM_LICENSE = "ODbL-1.0"
+OVERTURE_APACHE_LICENSE = "Apache-2.0"
+OVERTURE_CC0_LICENSE = "CC0-1.0"
+OVERTURE_CDLA_LICENSE = "CDLA-Permissive-2.0"
+
+
+def _overture_license_sql(provenance_column: str = "provenance") -> str:
+    """Return a DuckDB CASE expression for current Overture Places licenses.
+
+    Overture Places is multi-license at the upstream-provider level.  We infer
+    the applicable license only from provider provenance that Overture itself
+    exposes.  Unknown or mixed future providers are deliberately marked for
+    review rather than silently assigned a permissive license.
+    """
+    p = f"lower(coalesce(CAST({provenance_column} AS VARCHAR), ''))"
+    is_fsq = f"regexp_matches({p}, 'foursquare')"
+    is_atp = f"regexp_matches({p}, 'alltheplaces|all_the_places')"
+    is_cdla = (
+        f"regexp_matches({p}, 'meta|microsoft|pinmeto|krick|renderseo|"
+        "brightquery|dac')"
+    )
+    return (
+        "CASE "
+        f"WHEN ({is_fsq} AND ({is_atp} OR {is_cdla})) "
+        f"  OR ({is_atp} AND {is_cdla}) THEN 'MIXED/REVIEW' "
+        f"WHEN {is_fsq} THEN '{OVERTURE_APACHE_LICENSE}' "
+        f"WHEN {is_atp} THEN '{OVERTURE_CC0_LICENSE}' "
+        f"WHEN {is_cdla} THEN '{OVERTURE_CDLA_LICENSE}' "
+        "ELSE 'UNKNOWN' END"
+    )
 
 
 def check_external_tools() -> None:
@@ -245,7 +279,8 @@ def prepare_osm(
                     {category_expr} AS category,
                     ST_X(ST_Centroid(geom))::DOUBLE AS lon,
                     ST_Y(ST_Centroid(geom))::DOUBLE AS lat,
-                    NULL::VARCHAR AS provenance
+                    NULL::VARCHAR AS provenance,
+                    'ODbL-1.0'::VARCHAR AS upstream_license
                 FROM ST_Read('{seq.as_posix()}')
                 WHERE name IS NOT NULL AND trim(CAST(name AS VARCHAR)) <> ''
             ), norm AS (
@@ -408,6 +443,7 @@ def _write_empty_source_tile(path: Path, source: str) -> None:
         ("lon", pa.float64()),
         ("lat", pa.float64()),
         ("provenance", pa.string()),
+        ("upstream_license", pa.string()),
         ("name_norm", pa.string()),
         ("name_tokens", pa.string()),
     ])
@@ -514,6 +550,7 @@ def _overture_worker(
         categories.append("categories.primary")
     category_expr = "COALESCE(" + ", ".join(categories + ["NULL::VARCHAR"]) + ")" if categories else "NULL::VARCHAR"
     provenance_expr = "CAST(sources AS VARCHAR)" if "sources" in columns else "NULL::VARCHAR"
+    overture_license_expr = _overture_license_sql("provenance")
     status_pred = (
         "AND (operating_status IS NULL OR operating_status <> 'permanently_closed')"
         if "operating_status" in columns else ""
@@ -544,13 +581,15 @@ def _overture_worker(
                 FROM raw0
             ), ready AS (
                 SELECT source, source_id, name, category, lon, lat, provenance,
+                       {overture_license_expr} AS upstream_license,
                        name_norm,
                        array_to_string(list_sort(string_split(name_norm, ' ')), ' ') AS name_tokens,
                        geometry
                 FROM norm
                 WHERE name_norm <> ''
             )
-            SELECT source, source_id, name, category, lon, lat, provenance, name_norm, name_tokens
+            SELECT source, source_id, name, category, lon, lat, provenance, upstream_license,
+                   name_norm, name_tokens
             FROM ready, read_parquet('{boundary.as_posix()}') b
             WHERE {tile_pred}
               AND {scope_pred}
@@ -731,7 +770,8 @@ def _fsq_worker(
                             CAST(fsq_category_labels AS VARCHAR) AS category,
                             CAST(longitude AS DOUBLE) AS lon,
                             CAST(latitude AS DOUBLE) AS lat,
-                            NULL::VARCHAR AS provenance
+                            NULL::VARCHAR AS provenance,
+                            'Apache-2.0'::VARCHAR AS upstream_license
                         FROM read_parquet('{remote}', union_by_name=true)
                         WHERE country = 'PH'
                           AND date_closed IS NULL
@@ -743,7 +783,7 @@ def _fsq_worker(
                         SELECT *, {name_norm} AS name_norm
                         FROM raw
                     )
-                    SELECT source, source_id, name, category, lon, lat, provenance,
+                    SELECT source, source_id, name, category, lon, lat, provenance, upstream_license,
                            name_norm,
                            array_to_string(
                                list_sort(string_split(name_norm, ' ')), ' '

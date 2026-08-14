@@ -368,7 +368,7 @@ def prepare_matches(
     stop_file = edge_root / ".stop"
     stop_file.unlink(missing_ok=True)
 
-    # For the old-laptop profile this is intentionally 1 worker. The code still
+    # For the low-resource profile this is intentionally 1 worker. The code still
     # supports 2 if the user later confirms the machine has SSD + spare RAM.
     if workers == 1:
         try:

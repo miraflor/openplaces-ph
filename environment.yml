@@ -1,4 +1,4 @@
-name: ph-poi
+name: openplaces
 channels:
   - conda-forge
 dependencies:

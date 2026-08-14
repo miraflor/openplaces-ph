@@ -1,30 +1,20 @@
-# Philippine POI Triangulation
-## Old-laptop / whole-Philippines edition
+# OpenPlaces PH
 
-Build one **canonical Philippine point layer of establishments / POIs** by
-triangulating three open sources:
+**An open, provenance-aware geospatial registry of places and establishments in the Philippines.**
+
+OpenPlaces PH builds a canonical **point layer** of Philippine places and establishments by reconciling three open geospatial sources:
 
 1. **Foursquare OS Places**
 2. **Overture Maps Places**
-3. **OpenStreetMap**, using the Geofabrik Philippines `.osm.pbf`
+3. **OpenStreetMap**, using the Geofabrik Philippines extract
 
-The production target for this edition is deliberately modest hardware:
+The project is intended as reusable digital public infrastructure. Source observations are preserved, cross-source matches are auditable, provenance is explicit, and the nationwide pipeline is designed to survive interruptions on modest hardware.
 
-- Intel **Core i7-7700HQ** (4 physical cores / 8 threads)
-- **16 GB installed RAM**. RAM capacity does not normally "wear down" with age;
-  nevertheless, the pipeline deliberately budgets only a small fraction of it
-  so Windows, filesystem cache, antivirus, and other applications retain ample
-  headroom
-- old laptop storage, cooling, and possible thermal throttling
-- Windows 10/11 + Conda
-
-The code favors **survivability and reproducibility over maximum benchmark
-speed**. You can press `Ctrl+C`, shut the computer down, and resume later with
-minimal lost work.
+> OpenPlaces PH is not an official Philippine government registry. It is an open derived data pipeline whose quality depends on the upstream sources and the entity-resolution rules documented here.
 
 ---
 
-# What do I get?
+## What do I get?
 
 The main output is:
 
@@ -32,8 +22,9 @@ The main output is:
 data/output/philippines/canonical_pois.parquet
 ```
 
-It is a **GeoParquet point layer**. Each row is one inferred real-world POI,
-with the source records retained side by side:
+This is a **GeoParquet POINT layer**. Each row is one inferred real-world place or establishment.
+
+Core fields include:
 
 ```text
 canonical_id
@@ -51,15 +42,18 @@ match_score_min
 fsq_id
 fsq_name
 fsq_category
+fsq_license
 
 overture_id
 overture_name
 overture_category
 overture_provenance
+overture_license
 
 osm_id
 osm_name
 osm_category
+osm_license
 ```
 
 You also get:
@@ -68,467 +62,332 @@ You also get:
 data/output/philippines/observations.parquet
 ```
 
-Every normalized original source record, and:
+which contains the normalized source observations before canonical clustering, and:
 
 ```text
 data/output/philippines/match_edges.parquet
 ```
 
-An audit trail showing which cross-source records were linked, their distance,
-name/category similarities, total score, and whether the link survived final
-one-record-per-source clustering.
+which records the accepted cross-source candidate links, their distance and similarity scores, and whether each link survives the final one-record-per-source clustering constraint.
 
-The output is **not yet mapped to AFSA / EDUC / MFG / TRD / etc.** That should be
-a separate downstream classification step after the canonical POIs are stable.
+A compact run summary is written to:
 
----
-
-# Do I manually download the three datasets?
-
-**No.**
-
-The pipeline does the data acquisition itself.
-
-There is only one one-time manual access step: Foursquare OS Places is available
-through a gated Hugging Face dataset, so you must accept access and authenticate.
-
-Everything else is automatically downloaded, subsetted, normalized, cached,
-and resumed.
+```text
+data/output/philippines/summary.json
+```
 
 ---
 
-# One-time setup
+## Why three sources?
 
-## 1. Create the Conda environment
+No single open POI source is complete or perfectly classified. OpenPlaces PH treats each source as noisy evidence rather than as ground truth.
 
-From the repository directory:
+A record may therefore appear as:
+
+```text
+Foursquare:  Mercury Drug   -> Drugstore
+Overture:    Mercury Drug   -> pharmacy
+OSM:         Mercury Drug   -> amenity=pharmacy
+```
+
+and be represented in the canonical layer as one establishment while retaining all three source records.
+
+`source_count` is the number of downloaded source layers represented in a canonical POI. `known_independent_source_count` additionally discounts the visible case where an Overture record declares Foursquare provenance. It is **not** a statistical proof that all upstream collection systems are independent.
+
+---
+
+## Hardware profile
+
+The defaults are intentionally conservative. The reference machine is a roughly decade-old Windows laptop with an **Intel Core i7-7700HQ (4 cores / 8 threads) and 16 GB installed RAM**. The pipeline deliberately behaves as though substantially less memory and sustained CPU performance are safely available, leaving headroom for the operating system, antivirus, filesystem cache, thermal throttling, aging storage, and other applications.
+
+Default resource policy:
+
+| Setting | Default |
+|---|---:|
+| DuckDB memory per source worker | 512 MB |
+| DuckDB memory for national/final stages | 1 GB |
+| DuckDB threads per connection | 1 |
+| Overture workers | 1 |
+| Foursquare workers | 2 |
+| Matching workers | 1 |
+| Source checkpoint size | 1 degree |
+| Match checkpoint size | 0.25 degree x source pair |
+| Maximum cross-source match distance | 120 m |
+
+The pipeline is **disk-first**. It does not load a Philippines-wide GeoPandas or Pandas table into RAM. DuckDB is allowed to spill joins and sorts to disk.
+
+An SSD is strongly preferred for the temporary directory, but the pipeline can run on slower storage.
+
+---
+
+## Do I need to download the datasets manually?
+
+**No.** The pipeline acquires and caches the required source data itself.
+
+- OpenStreetMap: downloads the Philippines `.osm.pbf` from Geofabrik.
+- Overture: streams only Philippine bounding-box tiles from a pinned Overture release.
+- Foursquare: queries the gated FSQ OS Places Parquet release remotely and materializes only Philippine tiles.
+
+The only one-time manual step is authorizing access to the free Foursquare OS Places dataset on Hugging Face.
+
+---
+
+## Installation
+
+### 1. Install Miniconda or another Conda-compatible distribution
+
+Then open **Miniconda Prompt** or PowerShell with Conda initialized.
+
+### 2. Create the environment
+
+From the repository root:
 
 ```powershell
 conda env create -f environment.yml
-conda activate ph-poi
+conda activate openplaces
 ```
 
-This installs Python plus `osmium-tool`. The official Overture Python client is
-installed inside the environment and is used in streaming mode; you do not run
-its CLI manually. The environment pins `overturemaps==1.0.1` so the streaming
-API used by this repository does not change halfway through a reproducible run.
+The environment installs Python, DuckDB, PyArrow, Osmium, the Overture client, Hugging Face tooling, and the other required dependencies.
 
-## 2. Authorize Foursquare once
+### 3. Install OpenPlaces PH in editable mode
 
-Sign in to Hugging Face, open:
-
-```text
-foursquare/fsq-os-places
+```powershell
+pip install -e .
 ```
 
-accept the dataset conditions, then run:
+This provides the `openplaces` command.
+
+### 4. Authorize Foursquare once
+
+Accept access to the `foursquare/fsq-os-places` dataset on Hugging Face, then run:
 
 ```powershell
 hf auth login
 ```
 
-Use a read token.
+The authentication token is stored by Hugging Face outside this repository. Do **not** place tokens in source files.
 
-The token is stored by Hugging Face on your computer. DuckDB later obtains it
-through its Hugging Face `credential_chain`; the token is never committed to
-this repository.
-
----
-
-# Recommended production run
-
-For this laptop, I recommend running the three large phases separately.
-
-Assuming `D:\ph-poi-temp` is on the drive with the most free space:
-
-## Phase 1 — acquire and normalize all three sources
+### 5. Verify the installation
 
 ```powershell
-python run.py --scope philippines --only sources --temp-dir D:\ph-poi-temp
+pytest -q
+openplaces --help
 ```
 
-When that finishes, you can shut the laptop down.
+---
 
-## Phase 2 — triangulate
+## Recommended full-Philippines run
+
+For older hardware, use separate stages. If your fastest drive is `D:`, for example:
+
+### Stage 1 — acquire and normalize the three sources
 
 ```powershell
-python run.py --scope philippines --only match --temp-dir D:\ph-poi-temp
+openplaces --scope philippines --only sources --temp-dir D:\openplaces-temp
 ```
 
-Again, you can stop and resume.
-
-## Phase 3 — create the canonical point layer
+### Stage 2 — build resumable cross-source match shards
 
 ```powershell
-python run.py --scope philippines --only finalize --temp-dir D:\ph-poi-temp
+openplaces --scope philippines --only match --temp-dir D:\openplaces-temp
 ```
 
-Or simply use one command throughout:
+### Stage 3 — rank links, cluster observations, and build the canonical layer
 
 ```powershell
-python run.py --scope philippines --temp-dir D:\ph-poi-temp
+openplaces --scope philippines --only finalize --temp-dir D:\openplaces-temp
 ```
 
-Running that same command again is safe: completed checkpoints are detected and
-skipped.
-
----
-
-# Old-laptop defaults
-
-The defaults are intentionally conservative:
-
-```text
-remote source block             1.00 degree
-matching checkpoint             0.25 degree
-Overture workers                    1
-Foursquare workers                  2
-matching workers                    1
-DuckDB memory / worker           512 MB
-DuckDB memory / national stage     1 GB
-DuckDB threads / connection          1
-maximum cross-source distance      120 m
-```
-
-Why not use all 8 logical CPU threads?
-
-Because on an old laptop the national job is usually constrained by a
-combination of RAM, disk I/O, remote I/O, and heat. Eight competing analytical
-threads can make the computer page to disk and thermal-throttle, producing a
-*slower* end-to-end run.
-
-Foursquare gets two single-threaded workers because overlapping network latency
-can help. Overture defaults to one worker because its official streaming reader
-already performs internal I/O readahead. The CPU/disk-heavy matching phase also
-defaults to one worker.
-
-If the machine remains cool and Task Manager shows plenty of free RAM, you can
-experiment later with:
+You can also run the entire pipeline with:
 
 ```powershell
-python run.py --scope philippines --match-workers 2 --temp-dir D:\ph-poi-temp
+openplaces --scope philippines --temp-dir D:\openplaces-temp
 ```
 
-Do not start there.
+`python run.py ...` is retained as a repository-local alternative to the installed `openplaces` command.
 
-If the laptop struggles, use:
+---
+
+## Stop now, continue later
+
+The pipeline is deliberately crash-resumable.
+
+You may press:
+
+```text
+Ctrl+C
+```
+
+and later run the same command again. Completed checkpoints are reused.
+
+Durable work units are approximately:
+
+| Stage | Durable unit |
+|---|---|
+| Geofabrik download | resumable `.part` download |
+| OSM preparation | local processing stage |
+| Overture | 1 degree tile |
+| Foursquare | 1 degree tile |
+| Pairwise matching | 0.25 degree tile x source pair |
+| Greedy final clustering | ranked-edge row group / transactional checkpoint |
+
+To inspect progress without doing work:
 
 ```powershell
-python run.py --scope philippines `
-  --overture-workers 1 `
-  --fsq-workers 1 `
-  --match-workers 1 `
-  --worker-memory 384MB `
-  --main-memory 768MB `
-  --temp-dir D:\ph-poi-temp
+openplaces --scope philippines --status --temp-dir D:\openplaces-temp
 ```
 
 ---
 
-# How interruption/resume works
+## Storage
 
-The pipeline never treats "the Philippines" as one indivisible computation.
+For a nationwide run, keep generous free space for source caches, Parquet intermediates, and DuckDB spill files.
 
-## OSM
+A practical planning target is:
 
-```text
-resumable 600-ish MB national PBF download
-    -> filtered POI PBF checkpoint
-    -> GeoJSONSeq checkpoint
-    -> normalized 1-degree Parquet cache
-```
+- **30-40 GB free**: comfortable
+- **20 GB free**: may work, but gives less safety margin
 
-The big HTTP download resumes from its `.part` file when the server supports
-byte ranges.
-
-## Overture
-
-The pipeline first pins the current Overture release from the official STAC
-catalog. Each land-intersecting **1-degree block** is then streamed from that
-exact release into an independent atomic Parquet checkpoint. If one block
-fails, previously completed blocks are not touched. Resuming days later still
-uses the same pinned release, so a monthly Overture update cannot silently mix
-source vintages within one run.
-
-## Foursquare
-
-The global FSQ dataset is **not downloaded**. DuckDB queries the gated remote
-Parquet release with:
-
-```text
-country = PH
-+ one 1-degree bbox
-```
-
-Each completed Philippine block becomes a permanent local checkpoint. Remote
-HTTP reads use DuckDB's built-in retry controls, and a failed block is retried
-with a fresh bounded-memory DuckDB connection before the program gives up.
-
-The selected FSQ release date is cached. Overture is pinned in the same way.
-Resuming a run therefore does not mix records from different releases. Use
-`--refresh-sources` only when you actually want a new source snapshot.
-
-## Matching
-
-Each **0.25-degree tile × source pair** is one atomic checkpoint:
-
-```text
-FSQ       <-> Overture
-FSQ       <-> OSM
-Overture  <-> OSM
-```
-
-Completed edge files are never recomputed unless matching settings change or
-`--rebuild-match` is supplied.
-
-## Final clustering
-
-Cross-source links are globally ranked, then processed by a compact union-find.
-Its three numeric arrays use roughly ten bytes per source observation. The
-state is transactionally snapshotted after each 100,000-edge Parquet row group.
-A hard stop therefore replays only the unfinished row group rather than all
-national clustering.
+All generated data are under `data/`, which is excluded by `.gitignore` and should not be committed to GitHub.
 
 ---
 
-# Why this version is faster than the earlier low-RAM implementation
+## How matching works
 
-The most important optimization is not more parallelism. It is **doing less
-repeated work**.
+OpenPlaces PH does not perform a national all-pairs comparison.
 
-### Names are normalized once
+For each small match tile it:
 
-At source ingestion, each POI gets:
+1. reads only source files touching that tile plus a small halo;
+2. spatially blocks observations using a coarse coordinate grid;
+3. calculates exact Haversine distance for nearby candidates;
+4. compares normalized names with DuckDB Jaro-Winkler similarity;
+5. uses category similarity only as weak supporting evidence;
+6. applies stricter name thresholds as distance increases;
+7. makes generic names such as `ATM`, `Bank`, or `Clinic` deliberately difficult to merge; and
+8. greedily accepts the strongest links while forbidding a canonical cluster from containing two records from the same source.
 
-```text
-name_norm
-name_tokens
-```
+This last rule prevents common errors such as merging two Foursquare branches in the same shopping mall into one canonical establishment.
 
-`name_tokens` is the same normalized name with tokens alphabetically sorted.
-
-### Matching stays inside DuckDB
-
-The previous design sent candidate rows to Python/RapidFuzz. This edition uses
-DuckDB's native string functions:
-
-```text
-jaro_winkler_similarity(name_norm)
-jaro_winkler_similarity(name_tokens)
-```
-
-and takes the better score. This handles both minor spelling variation and many
-word-order differences while avoiding millions of Python-level function calls.
-
-### Spatial blocking happens before fuzzy matching
-
-A ~150 m numeric grid generates only neighboring-cell candidates. Exact
-Haversine distance then removes anything beyond 120 m before string scoring.
-There is never a Philippines-wide Cartesian product.
-
-### FSQ and Overture blocks are sorted by coordinate
-
-Their local 1-degree Parquet files are written `ORDER BY lon, lat` with small
-row groups. Subsequent 0.25-degree bbox filters can therefore benefit from
-Parquet row-group min/max pruning rather than repeatedly reading every row of
-the larger block.
-
-### Pandas is not part of the national pipeline
-
-The job uses DuckDB + Arrow/NumPy. Large country-wide dataframes are never
-created in Python.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the implementation details.
 
 ---
 
-# Matching policy
+## Canonical coordinates
 
-Candidate maximum distance:
+When multiple source observations form one canonical POI, its coordinates are the median longitude and latitude of the matched observations.
 
-```text
-120 metres
-```
-
-Default acceptance thresholds:
-
-| Distance | Minimum name similarity |
-|---:|---:|
-| <= 20 m | 0.70 |
-| <= 50 m | 0.82 |
-| <= 90 m | 0.90 |
-| <= 120 m | 0.94 |
-
-Generic or very short names (`ATM`, `bank`, `shop`, etc.) require approximately
-an exact name within 15 m.
-
-Accepted links are ranked approximately as:
-
-```text
-80% name similarity
-18% spatial closeness
- 2% category-string similarity
-```
-
-Category receives little weight because FSQ, Overture, and OSM do not use the
-same taxonomy.
-
-The final clustering enforces:
-
-> one FSQ + one Overture + one OSM observation maximum per canonical POI
-
-This is specifically intended to reduce false merging of multiple branches in
-malls and other dense complexes.
-
-Overture provenance is retained. If an Overture record itself came from
-Foursquare, `source_count` may be 2 while `known_independent_source_count` is only 1.
-
-`known_independent_source_count` is deliberately named conservatively: it only
-corrects dependencies that are visible in the downloaded provenance. It is **not**
-a statistical guarantee that all upstream collection pipelines are independent.
+OpenPlaces PH intentionally produces **points**, not building footprints. Building assignment can be implemented later as a separate spatial-enrichment layer without changing the canonical POI model.
 
 ---
 
-# Check progress
+## Evidence tiers
 
-At any time:
+The current output uses:
+
+```text
+single
+  observed in one source layer
+
+double
+  matched across two source layers
+
+triple
+  matched across all three source layers
+```
+
+These are evidence labels, not calibrated probabilities.
+
+A triple-source POI can still be wrong, and a high-quality single-source POI can still be real.
+
+---
+
+## Source snapshots and reproducibility
+
+Long national runs can span several sessions. To avoid silently mixing source vintages, OpenPlaces PH pins discovered Foursquare and Overture releases in local cache metadata and reuses them on resume.
+
+To deliberately acquire fresh source snapshots:
 
 ```powershell
-python run.py --scope philippines --status --temp-dir D:\ph-poi-temp
+openplaces --scope philippines --refresh-sources --temp-dir D:\openplaces-temp
 ```
 
-Typical output:
-
-```text
-OSM normalized cache: ready
-Overture 1° blocks: 63/84
-Foursquare 1° blocks: 41/84
-Match checkpoints: 0/4032
-canonical_pois.parquet: not ready
-```
-
-The exact block count depends on the current Philippine land mask.
+Changing source snapshots invalidates downstream matching/final outputs as appropriate.
 
 ---
 
-# How long will the whole Philippines take?
+## Data licensing
 
-Do not interpret these as benchmarks. Remote throughput, disk type, antivirus,
-Windows background activity, and laptop temperature can change the result by
-several times.
+The **software in this repository** is licensed under the MIT License.
 
-For an aging i7-7700HQ laptop, with conservative one-thread analytical work
-and only two concurrent workers during the network-heavy Foursquare stage, a
-reasonable *planning* range is:
+The **input and output data are not automatically MIT-licensed**.
 
-```text
-OSM acquisition/preparation       ~20–90 min
-Overture Philippine blocks        ~45 min–3.5 h
-Foursquare Philippine blocks      ~1.5–5 h
-matching                          ~1.5–5 h
-finalization                      ~30 min–2 h
-------------------------------------------------
-rough total                        ~6–15 h first run
-```
+The normalized observations preserve an `upstream_license` field. The canonical layer exposes source-specific license fields such as `fsq_license`, `overture_license`, and `osm_license`.
 
-An HDD, slow connection, antivirus scanning, severe thermal throttling, or a
-remote-service slowdown can push the run beyond that. **Budget an overnight run
-rather than depending on the lower end of the estimate.**
+Current upstream regimes include:
 
-Because almost everything is checkpointed, elapsed wall-clock time matters much
-less: it can be accumulated over several sessions.
+- Foursquare OS Places: Apache-2.0
+- OpenStreetMap: ODbL-1.0
+- Overture Places: provider-dependent, including CDLA-Permissive-2.0, Apache-2.0, and CC0-1.0
+
+See [`DATA_LICENSES.md`](DATA_LICENSES.md) before distributing derived datasets.
 
 ---
 
-# Disk space
-
-The current Geofabrik Philippines PBF is only around 600 MB, but temporary
-GeoJSON, source Parquet caches, edge shards, external sorts, and DuckDB spill
-files dominate the working footprint.
-
-Recommended:
+## Repository layout
 
 ```text
-20 GB free       bare minimum target
-30–40 GB free    much more comfortable
-```
-
-Use an SSD for `--temp-dir` if one exists. If the laptop only has an HDD, the
-pipeline still works, but matching/final sorting can be substantially slower.
-
----
-
-# Refreshing the data later
-
-Normal reruns use the cached source snapshot:
-
-```powershell
-python run.py --scope philippines --temp-dir D:\ph-poi-temp
-```
-
-To deliberately acquire current versions of all three sources and invalidate
-old matching:
-
-```powershell
-python run.py --scope philippines --refresh-sources --temp-dir D:\ph-poi-temp
-```
-
-Do this only when you actually want a new data vintage.
-
----
-
-# Repository layout
-
-```text
-ph-poi-triangulation/
-├── .github/workflows/tests.yml
-├── .gitignore
-├── README.md
-├── CHANGELOG.md
-├── LICENSE
-├── environment.yml
-├── pyproject.toml
-├── run.py
+openplaces-ph/
+├── .github/
+│   └── workflows/
+│       └── tests.yml
 ├── config/
 │   └── areas.yml
 ├── docs/
 │   └── ARCHITECTURE.md
-├── src/ph_poi/
-│   ├── __init__.py
-│   ├── cli.py
-│   ├── config.py
-│   ├── db.py
-│   ├── finalize.py
-│   ├── matching.py
-│   ├── sources.py
-│   ├── tiles.py
-│   └── util.py
-└── tests/
-    ├── test_matching.py
-    └── test_tiles.py
+├── src/
+│   └── openplaces_ph/
+│       ├── __init__.py
+│       ├── cli.py
+│       ├── config.py
+│       ├── db.py
+│       ├── finalize.py
+│       ├── matching.py
+│       ├── sources.py
+│       ├── tiles.py
+│       └── util.py
+├── tests/
+│   ├── test_matching.py
+│   └── test_tiles.py
+├── CHANGELOG.md
+├── DATA_LICENSES.md
+├── LICENSE
+├── README.md
+├── environment.yml
+├── pyproject.toml
+└── run.py
 ```
 
-`data/` is deliberately in `.gitignore`. **GitHub stores the reproducible
-pipeline, not gigabytes of source data or generated checkpoints.**
+---
+
+## Development checks
+
+Before committing changes:
+
+```powershell
+conda activate openplaces
+pip install -e .
+pytest -q
+python -m compileall src tests run.py
+openplaces --help
+```
+
+GitHub Actions also runs the unit tests on pushes and pull requests.
 
 ---
 
-# External documentation used by the implementation
+## Project status
 
-- Overture Python client: https://docs.overturemaps.org/getting-data/overturemaps-py/
-- Overture STAC catalog: https://docs.overturemaps.org/getting-data/cloud-sources/
-- DuckDB configuration: https://duckdb.org/docs/current/configuration/overview
-- DuckDB text similarity: https://duckdb.org/docs/stable/sql/functions/text
-- Hugging Face gated dataset + DuckDB auth: https://huggingface.co/docs/hub/datasets-duckdb-auth
-- Geofabrik Philippines OSM: https://download.geofabrik.de/asia/philippines.html
+OpenPlaces PH is an early public release. The current priority is to establish a reproducible nationwide canonical places layer with transparent provenance and conservative matching.
 
----
-
-# Data licensing / provenance
-
-The **code** in this repository is MIT-licensed. The downloaded data are not
-relicensed by this repository. Keep the source IDs and provenance columns in
-published derivatives and comply with the licenses/attribution requirements of
-Foursquare OS Places, the relevant Overture source records, and OpenStreetMap.
-
-In particular, do not interpret the MIT `LICENSE` file as applying to the
-contents of `data/`. `data/` is intentionally gitignored for this reason as well
-as for size.
+Likely future layers include category harmonization, Philippine industry classification, administrative geography, building association, validation samples, and versioned public data releases.

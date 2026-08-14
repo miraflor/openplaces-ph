@@ -3,7 +3,7 @@
 The entire project is designed around one rule: *do not let DuckDB assume it
 owns the whole machine*.  A modern analytical database can eagerly use a large
 fraction of RAM and all CPU threads.  That is desirable on a server, but not on
-an old laptop that is also running Windows.
+a resource-constrained laptop that is also running Windows.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def connect(
     memory_limit:
         Hard-ish DuckDB memory budget for this connection (e.g. ``"512MB"``).
     threads:
-        Keep this low on old hardware. One DuckDB thread plus OS caching is often
+        Keep this low on aging hardware. One DuckDB thread plus OS caching is often
         faster overall than forcing 8 logical threads to fight over RAM/disk.
     spatial/httpfs:
         Load only the extensions needed by the current stage.

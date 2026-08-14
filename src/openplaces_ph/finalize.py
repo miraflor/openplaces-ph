@@ -94,7 +94,7 @@ def build_observations(
     Important optimization: there is intentionally NO national DISTINCT/window
     deduplication here. Source blocks use half-open, non-overlapping tile bounds,
     and each provider has a stable source ID. Running a country-wide window sort
-    merely to rediscover that fact is expensive on an old laptop.
+    merely to rediscover that fact is expensive on an resource-constrained laptop.
 
     The raw source ID is retained, so duplicate-ID diagnostics can still be run
     later without making the normal pipeline pay for a global sort.
@@ -112,7 +112,7 @@ def build_observations(
         code = SOURCE_CODE[source]
         priority = SOURCE_PRIORITY[source]
         parts.append(
-            f"SELECT source, source_id, name, category, lon, lat, provenance, "
+            f"SELECT source, source_id, name, category, lon, lat, provenance, upstream_license, "
             f"{code}::UTINYINT AS source_code, {priority}::UTINYINT AS source_priority "
             f"FROM read_parquet({quote_paths(files)}, union_by_name=true)"
         )
@@ -138,7 +138,7 @@ def build_observations(
             )
             SELECT
                 row_number() OVER () - 1 AS row_id,
-                source, source_id, name, category, lon, lat, provenance,
+                source, source_id, name, category, lon, lat, provenance, upstream_license,
                 source_code, source_priority
             FROM valid
         ) TO '{tmp.as_posix()}' (
@@ -404,13 +404,16 @@ def build_canonical(
                     max(source_id) FILTER (WHERE source='fsq') AS fsq_id,
                     max(name) FILTER (WHERE source='fsq') AS fsq_name,
                     max(category) FILTER (WHERE source='fsq') AS fsq_category,
+                    max(upstream_license) FILTER (WHERE source='fsq') AS fsq_license,
                     max(source_id) FILTER (WHERE source='overture') AS overture_id,
                     max(name) FILTER (WHERE source='overture') AS overture_name,
                     max(category) FILTER (WHERE source='overture') AS overture_category,
                     max(provenance) FILTER (WHERE source='overture') AS overture_provenance,
+                    max(upstream_license) FILTER (WHERE source='overture') AS overture_license,
                     max(source_id) FILTER (WHERE source='osm') AS osm_id,
                     max(name) FILTER (WHERE source='osm') AS osm_name,
-                    max(category) FILTER (WHERE source='osm') AS osm_category
+                    max(category) FILTER (WHERE source='osm') AS osm_category,
+                    max(upstream_license) FILTER (WHERE source='osm') AS osm_license
                 FROM j
                 GROUP BY cluster_root
             ), ms AS (
@@ -447,9 +450,9 @@ def build_canonical(
                     (fsq_id IS NOT NULL AND overture_id IS NOT NULL
                      AND regexp_matches(lower(coalesce(overture_provenance,'')), 'foursquare|\\bfsq\\b'))
                         AS overture_has_foursquare_provenance,
-                    fsq_id, fsq_name, fsq_category,
-                    overture_id, overture_name, overture_category, overture_provenance,
-                    osm_id, osm_name, osm_category
+                    fsq_id, fsq_name, fsq_category, fsq_license,
+                    overture_id, overture_name, overture_category, overture_provenance, overture_license,
+                    osm_id, osm_name, osm_category, osm_license
                 FROM a
                 LEFT JOIN ms USING (cluster_root)
             )

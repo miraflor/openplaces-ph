@@ -1,4 +1,4 @@
-from ph_poi.tiles import Tile, bbox_with_halo, child_tiles, tiles_for_bboxes
+from openplaces_ph.tiles import Tile, bbox_with_halo, child_tiles, tiles_for_bboxes
 
 
 def test_source_tile_count_and_keys():

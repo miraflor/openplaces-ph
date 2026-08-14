@@ -26,7 +26,7 @@ from .util import free_gb, valid_parquet
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Old-laptop-friendly, crash-resumable triangulation of Philippine "
+            "Low-resource-friendly, crash-resumable triangulation of Philippine "
             "POIs from Foursquare, Overture, and OSM."
         )
     )
@@ -60,13 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--match-workers", type=int, default=1,
-        help="Parallel match workers. Default 1 for the old-laptop profile.",
+        help="Parallel match workers. Default 1 for the low-resource profile.",
     )
 
     # The laptop has 16 GB installed RAM, but the pipeline intentionally claims
     # only a small fraction of it. RAM capacity itself does not normally shrink
     # with age; the headroom is for Windows, antivirus, filesystem cache, other
-    # applications, and the less predictable I/O/thermal behavior of old hardware.
+    # applications, and the less predictable I/O/thermal behavior of aging hardware.
     p.add_argument("--worker-memory", default="512MB", help="DuckDB cap per parallel worker.")
     p.add_argument("--main-memory", default="1GB", help="DuckDB cap for national single-process stages.")
     p.add_argument("--temp-dir", help="DuckDB spill directory. Prefer an SSD with >=20 GB free.")
