@@ -1,0 +1,27 @@
+name: ph-poi
+channels:
+  - conda-forge
+dependencies:
+  # Python 3.11 is mature and well supported by all libraries used here.
+  - python=3.11
+
+  # Osmium does the heavy OSM PBF filtering/export outside Python. This is
+  # considerably more memory-efficient than trying to parse a national PBF
+  # into GeoPandas.
+  - osmium-tool>=1.18
+
+  # DuckDB is the workhorse for out-of-core Parquet filtering, joining,
+  # sorting, and final aggregation. Large operations are explicitly allowed
+  # to spill to disk by the code.
+  - duckdb>=1.4,<2
+  - numpy
+  - pyarrow
+  - pyyaml
+  - requests
+  - huggingface_hub
+  - pytest
+  - pip
+
+  # Overture's official Python/CLI client is distributed on PyPI.
+  - pip:
+      - overturemaps==1.0.1

@@ -1,0 +1,25 @@
+# Bounding boxes are [west, south, east, north].
+# They are intentionally broad functional-urban-area boxes, not legal city boundaries.
+philippines_bbox: [116.80, 4.40, 126.70, 21.30]
+
+areas:
+  metro_manila: [120.85, 14.30, 121.20, 14.90]
+  metro_cebu: [123.70, 10.10, 124.10, 10.60]
+  metro_davao: [125.20, 6.85, 125.80, 7.40]
+  iloilo: [122.40, 10.55, 122.70, 10.85]
+  bacolod: [122.80, 10.50, 123.10, 10.85]
+  cagayan_de_oro: [124.45, 8.30, 124.90, 8.65]
+  baguio: [120.50, 16.28, 120.70, 16.52]
+  angeles_san_fernando: [120.45, 14.85, 120.85, 15.30]
+  naga: [123.10, 13.50, 123.40, 13.80]
+  legazpi: [123.65, 13.05, 123.85, 13.25]
+  general_santos: [124.95, 5.90, 125.30, 6.30]
+  zamboanga: [121.90, 6.75, 122.25, 7.15]
+  iligan: [124.15, 8.10, 124.35, 8.35]
+  butuan: [125.45, 8.80, 125.65, 9.05]
+  dumaguete: [122.90, 9.20, 123.10, 9.40]
+  tagbilaran: [123.80, 9.55, 123.95, 9.75]
+  tacloban: [124.95, 11.15, 125.15, 11.35]
+  batangas_lipa: [120.90, 13.70, 121.25, 14.10]
+  lucena: [121.50, 13.85, 121.75, 14.05]
+  tuguegarao: [121.65, 17.55, 121.85, 17.75]

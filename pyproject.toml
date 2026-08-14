@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ph-poi-triangulation"
+version = "0.5.0"
+description = "Crash-resumable, old-laptop-friendly triangulation of Philippine POIs from Foursquare, Overture, and OSM."
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Project contributors"}]
+dependencies = [
+    "duckdb>=1.4,<2",
+    "numpy",
+    "pyarrow",
+    "PyYAML",
+    "requests",
+    "huggingface_hub",
+    "overturemaps==1.0.1",
+]
+
+[project.scripts]
+ph-poi = "ph_poi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
