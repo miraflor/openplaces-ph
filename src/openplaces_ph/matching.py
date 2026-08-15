@@ -5,16 +5,26 @@ time. That is accurate but unnecessarily expensive on a 2016/2017-era CPU.
 This edition does the whole candidate generation + string scoring in DuckDB:
 
 * numeric grid blocking prevents an all-pairs join;
-* only POIs within 120 m survive;
+* a separable degree-bound prefilter runs *before* any trigonometry, so exact
+  Haversine is only evaluated for pairs that could plausibly be within range;
+* only POIs within ``max_distance_m`` survive;
 * names were normalized once at source ingestion;
 * DuckDB's native Jaro-Winkler similarity scores both original token order and
   alphabetically sorted tokens, which handles e.g. "SM North Starbucks" versus
   "Starbucks SM North" without Python/RapidFuzz overhead;
-* every 0.25-degree tile × source-pair is an atomic Parquet checkpoint.
+* every 0.25-degree tile x source-pair is an atomic Parquet checkpoint.
+
+Single source of truth for thresholds
+-------------------------------------
+The distance/name acceptance ladder is defined **once** in
+:func:`acceptance_bands`.  Both the SQL executed by DuckDB and the pure-Python
+:func:`accept_pair` are generated from it, so the unit-tested Python mirror
+cannot silently drift from the SQL that actually produces the data.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -33,12 +43,32 @@ from .util import atomic_json, quote_paths, valid_parquet
 EARTH_RADIUS_M = 6_371_008.8
 PAIRS = (("fsq", "overture"), ("fsq", "osm"), ("overture", "osm"))
 
+# Geodesy constants used to convert a metre budget into a *safe upper bound* in
+# degrees anywhere in the Philippines.
+#
+# * 1 degree of latitude is never shorter than ~110,574 m (it grows towards the
+#   poles), so dividing by the minimum yields the largest possible degree span.
+# * 1 degree of longitude is 111,320 m x cos(latitude).  The Philippine bbox
+#   reaches 21.30 N, so cos(21.5 deg) is a conservative worst case.
+METRES_PER_DEG_LAT_MIN = 110_574.0
+METRES_PER_DEG_LON_EQUATOR = 111_320.0
+MIN_COS_LAT_PH = math.cos(math.radians(21.5))
+METRES_PER_DEG_LON_MIN_PH = METRES_PER_DEG_LON_EQUATOR * MIN_COS_LAT_PH
+
 # Short/generic business labels are dangerous in malls, campuses, airports,
 # markets, etc. They require essentially exact names at very short distance.
 GENERIC_NAMES = {
     "atm", "office", "store", "shop", "canteen", "market", "restaurant",
     "school", "church", "clinic", "hospital", "pharmacy", "bank", "terminal",
 }
+
+GENERIC_MAX_DISTANCE_M = 15.0
+GENERIC_MIN_NAME_SCORE = 0.99
+GENERIC_MAX_NAME_LENGTH = 4
+
+# Jaro-Winkler score_cutoff. Anything below the *lowest* band threshold cannot
+# be accepted, so telling DuckDB to short-circuit there is free accuracy-wise.
+JW_SCORE_CUTOFF = 0.65
 
 EDGE_SCHEMA = pa.schema([
     ("left_source", pa.string()),
@@ -59,36 +89,179 @@ class MatchConfig:
     # providers, but strict name thresholds rise rapidly with distance.
     max_distance_m: float = 120.0
 
-    # 0.0015 degree is ~155-167 m across Philippine latitudes. Therefore a
-    # 3×3 neighbor-cell join safely covers the 120 m search radius.
-    grid_degrees: float = 0.0015
+    # Multiplicative headroom applied to every metre->degree conversion so
+    # floating-point edges never cost us a genuine candidate pair.
+    safety: float = 1.02
+
+    def __post_init__(self) -> None:
+        """Reject settings that could make the blocking guarantee meaningless.
+
+        The CLI already checks ``--max-distance``, but this dataclass is also
+        imported directly by tests and by people who may build on the library.
+        Rejecting NaN/infinity here prevents surprising SQL such as a negative
+        grid size or an unbounded distance literal.  ``safety`` must be at least
+        1.0 because values below one could shrink the grid enough to lose genuine
+        in-range pairs before Haversine ever sees them.
+        """
+        if not math.isfinite(self.max_distance_m) or self.max_distance_m <= 0:
+            raise ValueError("max_distance_m must be a positive finite number")
+        if not math.isfinite(self.safety) or self.safety < 1.0:
+            raise ValueError("safety must be finite and at least 1.0")
+
+    @property
+    def grid_degrees(self) -> float:
+        """Blocking cell size, derived from ``max_distance_m``.
+
+        A 3x3 neighbour join only guarantees coverage out to *one* cell width.
+        Deriving the cell from the search radius (instead of hard-coding it)
+        keeps ``--max-distance`` correct at any value, and the tighter default
+        cell emits substantially fewer candidate pairs than a fixed 0.0015 deg.
+        """
+        return (self.max_distance_m * self.safety) / METRES_PER_DEG_LON_MIN_PH
+
+    @property
+    def delta_lat_degrees(self) -> float:
+        """Upper bound on the latitude separation of an in-range pair."""
+        return (self.max_distance_m * self.safety) / METRES_PER_DEG_LAT_MIN
+
+    @property
+    def delta_lon_degrees(self) -> float:
+        """Upper bound on the longitude separation of an in-range pair."""
+        return (self.max_distance_m * self.safety) / METRES_PER_DEG_LON_MIN_PH
+
+    def describe(self) -> dict:
+        """Config fingerprint recorded next to the edge checkpoints."""
+        return {
+            "max_distance_m": self.max_distance_m,
+            "safety": self.safety,
+            "grid_degrees": self.grid_degrees,
+            "bands": [list(b) for b in acceptance_bands(self.max_distance_m)],
+            "generic_max_distance_m": GENERIC_MAX_DISTANCE_M,
+            "generic_min_name_score": GENERIC_MIN_NAME_SCORE,
+            "scorer": "duckdb_jaro_winkler_name_and_sorted_tokens_v1",
+        }
 
 
-def accept_pair(distance_m: float, name_score: float, left_norm: str, right_norm: str) -> bool:
-    """Pure-Python mirror of the SQL thresholds, mainly for unit tests."""
+# ---------------------------------------------------------------------------
+# Acceptance ladder: one definition, two renderings
+# ---------------------------------------------------------------------------
+
+# The matching calibration is a *piecewise* rule.  The score attached to a
+# distance interval belongs to that interval even when the user chooses a
+# smaller maximum radius.  For example, a 60 m run should still use 0.90 for
+# the 50-60 m slice; it must NOT suddenly inherit the 0.94 rule that normally
+# applies only beyond 90 m.
+#
+# The final ``math.inf`` band is not written to SQL as infinity.  It simply
+# tells ``acceptance_bands`` which threshold applies to the tail of the
+# configured radius.
+CALIBRATED_BANDS: tuple[tuple[float, float], ...] = (
+    (20.0, 0.70),
+    (50.0, 0.82),
+    (90.0, 0.90),
+    (math.inf, 0.94),
+)
+
+
+def acceptance_bands(max_distance_m: float) -> tuple[tuple[float, float], ...]:
+    """Return the calibrated distance/name ladder truncated at ``max_distance_m``.
+
+    Think of the calibration as four distance intervals::
+
+        0-20 m    -> name score >= 0.70
+        20-50 m   -> name score >= 0.82
+        50-90 m   -> name score >= 0.90
+        >90 m     -> name score >= 0.94
+
+    ``--max-distance`` changes where we stop looking; it does **not** change the
+    threshold inside the final partial interval.  That distinction matters for
+    non-default radii such as 30 m or 60 m.
+    """
+    if not math.isfinite(max_distance_m) or max_distance_m <= 0:
+        raise ValueError("max_distance_m must be a positive finite number")
+
+    result: list[tuple[float, float]] = []
+    max_d = float(max_distance_m)
+    for upper, min_score in CALIBRATED_BANDS:
+        if max_d <= upper:
+            result.append((max_d, min_score))
+            break
+        result.append((float(upper), min_score))
+    return tuple(result)
+
+
+def generic_expr(column: str) -> str:
+    """SQL predicate: is this normalized name too generic to merge loosely?"""
+    values = ",".join("'" + x.replace("'", "''") + "'" for x in sorted(GENERIC_NAMES))
+    return f"({column} IN ({values}) OR length({column}) <= {GENERIC_MAX_NAME_LENGTH})"
+
+
+def acceptance_sql(
+    cfg: MatchConfig,
+    distance_col: str = "distance_m",
+    score_col: str = "name_score",
+    left_name_col: str = "name_left",
+    right_name_col: str = "name_right",
+) -> str:
+    """Render the acceptance ladder as one boolean SQL expression.
+
+    ``tests/test_threshold_parity.py`` evaluates this expression in DuckDB and
+    asserts it agrees with :func:`accept_pair` on random inputs.
+    """
+    # Generic labels get an even stricter rule, but the global radius remains
+    # absolute.  The explicit ``least`` also keeps this helper correct when it
+    # is tested outside the candidate CTE (where the upstream distance filter is
+    # not present).
+    generic_limit = min(GENERIC_MAX_DISTANCE_M, cfg.max_distance_m)
+    ladder = ["CASE"]
+    ladder.append(
+        f" WHEN {generic_expr(left_name_col)} OR {generic_expr(right_name_col)} "
+        f"THEN {distance_col} <= {generic_limit} "
+        f"AND {score_col} >= {GENERIC_MIN_NAME_SCORE}"
+    )
+    for upper, min_score in acceptance_bands(cfg.max_distance_m):
+        ladder.append(f" WHEN {distance_col} <= {upper} THEN {score_col} >= {min_score}")
+    ladder.append(" ELSE false END")
+    return (
+        f"(length(coalesce({left_name_col}, '')) > 0 "
+        f"AND length(coalesce({right_name_col}, '')) > 0 "
+        f"AND {''.join(ladder)})"
+    )
+
+
+def accept_pair(
+    distance_m: float,
+    name_score: float,
+    left_norm: str,
+    right_norm: str,
+    max_distance_m: float = 120.0,
+) -> bool:
+    """Pure-Python mirror of :func:`acceptance_sql`.
+
+    Kept in lockstep with the SQL by a parity test rather than by hand.
+    """
     if not left_norm or not right_norm:
         return False
     generic = (
         left_norm in GENERIC_NAMES
         or right_norm in GENERIC_NAMES
-        or len(left_norm) <= 4
-        or len(right_norm) <= 4
+        or len(left_norm) <= GENERIC_MAX_NAME_LENGTH
+        or len(right_norm) <= GENERIC_MAX_NAME_LENGTH
     )
     if generic:
-        return distance_m <= 15 and name_score >= 0.99
-    if distance_m <= 20:
-        return name_score >= 0.70
-    if distance_m <= 50:
-        return name_score >= 0.82
-    if distance_m <= 90:
-        return name_score >= 0.90
-    return distance_m <= 120 and name_score >= 0.94
+        return (
+            distance_m <= min(GENERIC_MAX_DISTANCE_M, max_distance_m)
+            and name_score >= GENERIC_MIN_NAME_SCORE
+        )
+    for upper, min_score in acceptance_bands(max_distance_m):
+        if distance_m <= upper:
+            return name_score >= min_score
+    return False
 
 
-def _generic_sql(alias: str) -> str:
-    values = ",".join("'" + x.replace("'", "''") + "'" for x in sorted(GENERIC_NAMES))
-    return f"({alias}.name_norm IN ({values}) OR length({alias}.name_norm) <= 4)"
-
+# ---------------------------------------------------------------------------
+# Candidate generation
+# ---------------------------------------------------------------------------
 
 def _candidate_sql(
     a_files: list[Path],
@@ -103,26 +276,24 @@ def _candidate_sql(
     halo = bbox_with_halo(core.bbox, cfg.max_distance_m)
     aw, as_, ae, an = core.bbox
     bw, bs, be, bn = halo
-    scope_a = bbox_sql("lon", "lat", scope.bboxes)
-    scope_b = bbox_sql("lon", "lat", scope.bboxes)
+    scope_pred = bbox_sql("lon", "lat", scope.bboxes)
     g = cfg.grid_degrees
     max_d = cfg.max_distance_m
-
-    generic_a = _generic_sql("s")
-    generic_b = _generic_sql("s")  # rewritten below for the right-name aliases
-    # _generic_sql emits "s.name_norm"; simple replacement keeps the generic
-    # vocabulary defined in exactly one place.
-    generic_left = generic_a.replace("s.name_norm", "name_left")
-    generic_right = generic_b.replace("s.name_norm", "name_right")
+    dlat = cfg.delta_lat_degrees
+    dlon = cfg.delta_lon_degrees
 
     if {a, b} == {"fsq", "overture"}:
         ov_provenance = "right_provenance" if b == "overture" else "left_provenance"
-        independent_expr = f"NOT regexp_matches(lower(coalesce({ov_provenance},'')), 'foursquare|\\bfsq\\b')"
+        independent_expr = (
+            f"NOT regexp_matches(lower(coalesce({ov_provenance},'')), 'foursquare|\\\\bfsq\\\\b')"
+        )
     else:
         independent_expr = "true"
 
     # The query is intentionally staged. DuckDB can push the bbox predicates
-    # into Parquet row groups before the more expensive similarity functions.
+    # into Parquet row groups before the more expensive similarity functions,
+    # and the cheap separable degree bounds in the join keep trigonometry off
+    # grid-adjacent pairs that are obviously out of range.
     return f"""
     WITH aa AS (
         SELECT source_id, name, category, provenance, name_norm, name_tokens, lon, lat,
@@ -130,7 +301,7 @@ def _candidate_sql(
                CAST(floor(lat / {g}) AS BIGINT) AS gy
         FROM read_parquet({quote_paths(a_files)}, union_by_name=true)
         WHERE lon >= {aw} AND lon < {ae} AND lat >= {as_} AND lat < {an}
-          AND {scope_a}
+          AND {scope_pred}
     ),
     bb AS (
         SELECT source_id, name, category, provenance, name_norm, name_tokens, lon, lat,
@@ -138,7 +309,7 @@ def _candidate_sql(
                CAST(floor(lat / {g}) AS BIGINT) AS gy
         FROM read_parquet({quote_paths(b_files)}, union_by_name=true)
         WHERE lon >= {bw} AND lon < {be} AND lat >= {bs} AND lat < {bn}
-          AND {scope_b}
+          AND {scope_pred}
     ),
     aneigh AS (
         SELECT aa.*, aa.gx + dx AS ngx, aa.gy + dy AS ngy
@@ -146,7 +317,7 @@ def _candidate_sql(
         CROSS JOIN UNNEST([-1, 0, 1]) AS x(dx)
         CROSS JOIN UNNEST([-1, 0, 1]) AS y(dy)
     ),
-    near AS (
+    boxed AS (
         SELECT
             a.source_id AS left_source_id,
             b.source_id AS right_source_id,
@@ -158,13 +329,22 @@ def _candidate_sql(
             b.category AS right_category,
             a.provenance AS left_provenance,
             b.provenance AS right_provenance,
-            2 * {EARTH_RADIUS_M} * asin(sqrt(
-                pow(sin(radians(b.lat - a.lat) / 2), 2)
-                + cos(radians(a.lat)) * cos(radians(b.lat))
-                * pow(sin(radians(b.lon - a.lon) / 2), 2)
-            )) AS distance_m
+            a.lon AS left_lon, a.lat AS left_lat,
+            b.lon AS right_lon, b.lat AS right_lat
         FROM aneigh a
-        JOIN bb b ON a.ngx = b.gx AND a.ngy = b.gy
+        JOIN bb b
+          ON a.ngx = b.gx AND a.ngy = b.gy
+         AND b.lat BETWEEN a.lat - {dlat} AND a.lat + {dlat}
+         AND b.lon BETWEEN a.lon - {dlon} AND a.lon + {dlon}
+    ),
+    near AS (
+        SELECT * EXCLUDE (left_lon, left_lat, right_lon, right_lat),
+            2 * {EARTH_RADIUS_M} * asin(sqrt(
+                pow(sin(radians(right_lat - left_lat) / 2), 2)
+                + cos(radians(left_lat)) * cos(radians(right_lat))
+                * pow(sin(radians(right_lon - left_lon) / 2), 2)
+            )) AS distance_m
+        FROM boxed
     ),
     within_distance AS (
         SELECT *
@@ -174,23 +354,15 @@ def _candidate_sql(
     named AS (
         SELECT *,
             greatest(
-                jaro_winkler_similarity(name_left, name_right, 0.65),
-                jaro_winkler_similarity(tokens_left, tokens_right, 0.65)
+                jaro_winkler_similarity(name_left, name_right, {JW_SCORE_CUTOFF}),
+                jaro_winkler_similarity(tokens_left, tokens_right, {JW_SCORE_CUTOFF})
             ) AS name_score
         FROM within_distance
     ),
     accepted AS (
         SELECT *
         FROM named
-        WHERE
-            CASE
-                WHEN {generic_left} OR {generic_right}
-                    THEN distance_m <= 15 AND name_score >= 0.99
-                WHEN distance_m <= 20 THEN name_score >= 0.70
-                WHEN distance_m <= 50 THEN name_score >= 0.82
-                WHEN distance_m <= 90 THEN name_score >= 0.90
-                ELSE name_score >= 0.94
-            END
+        WHERE {acceptance_sql(cfg)}
     ),
     scored AS (
         SELECT *,
@@ -341,13 +513,8 @@ def prepare_matches(
     """Create all pairwise edge shards; safe to interrupt and rerun."""
     edge_root = root / "data" / "work" / scope.slug / "edges"
     manifest = edge_root / "_config.json"
-    config_payload = {
-        "source_tile_deg": source_tile_deg,
-        "match_tile_deg": match_tile_deg,
-        "max_distance_m": cfg.max_distance_m,
-        "grid_degrees": cfg.grid_degrees,
-        "scorer": "duckdb_jaro_winkler_name_and_sorted_tokens_v1",
-    }
+    config_payload = dict(cfg.describe(), source_tile_deg=source_tile_deg,
+                          match_tile_deg=match_tile_deg)
 
     if manifest.exists() and not rebuild:
         import json

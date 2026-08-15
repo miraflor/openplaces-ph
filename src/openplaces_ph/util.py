@@ -113,13 +113,26 @@ def resume_download(
                         got += len(chunk)
                         if expected:
                             print(f"\r  {got / expected:6.1%}", end="", flush=True)
-                    # Push Python's userspace buffer to the OS before deciding
-                    # this network attempt is complete. We do not fsync every
+                    # Push Python's userspace buffer to the OS *and* to the
+                    # platter before deciding this network attempt is complete.
+                    # Without the fsync, a power loss can leave the .part file
+                    # with a size the data never reached, and the next resume
+                    # would append at the wrong offset. We do not fsync every
                     # chunk because that would be extremely slow on an old disk.
                     f.flush()
+                    os.fsync(f.fileno())
 
                 if expected:
                     print()
+
+            # A chunked response can end early without raising. Promoting a
+            # short file would poison the cache permanently, because every
+            # later run sees a "complete" download and skips it.
+            if expected and got != expected:
+                raise RuntimeError(
+                    f"Incomplete download: got {got} of {expected} bytes. "
+                    "Partial bytes are preserved; retrying."
+                )
 
             os.replace(part, target)
             return target

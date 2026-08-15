@@ -1,6 +1,6 @@
 """Acquire and normalize the three POI sources.
 
-Design goals for an resource-constrained laptop
+Design goals for a resource-constrained laptop
 ------------------------------
 1. Never download a worldwide dataset when a Philippine subset can be queried.
 2. Keep remote work in 1-degree blocks, so a failed request loses one block.
@@ -24,10 +24,12 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
-from huggingface_hub import HfApi, get_token
 
-from overturemaps import record_batch_reader
-from overturemaps.writers import copy as overture_copy, get_writer
+# NOTE: ``huggingface_hub`` and ``overturemaps`` are imported lazily inside the
+# functions that actually acquire data. Importing them at module scope made
+# ``openplaces --status`` and the pure-logic unit tests depend on the full
+# network client stack for no reason.
+from functools import lru_cache
 
 from .config import Scope, bbox_sql
 from .db import connect
@@ -42,6 +44,13 @@ OVERTURE_STAC = "https://stac.overturemaps.org/catalog.json"
 # from Geofabrik's Philippine extract; Overture is subsequently clipped to the
 # Overture country land polygon; FSQ is filtered with country='PH'.
 PH_BBOX = (116.80, 4.40, 126.70, 21.30)
+
+# Overture/GeoJSON coordinates are longitude, latitude in WGS 84. DuckDB 1.5
+# can carry CRS information in the GEOMETRY type itself; making it explicit
+# prevents accidental mixing of "geometry with CRS" and "geometry without CRS"
+# after a future library upgrade. OGC:CRS84 uses the familiar X=longitude,
+# Y=latitude axis order.
+CRS84 = "OGC:CRS84"
 
 # OSM keys that strongly suggest that an object is a POI/establishment. We keep
 # named objects carrying any of these keys. This is intentionally broader than
@@ -64,6 +73,15 @@ OSM_KEYS = (
 
 # SPDX-style identifiers used in the normalized observation layer.  These are
 # data licenses, not the MIT license covering OpenPlaces PH's source code.
+# Overture Places are the only source clipped by geometry (Foursquare uses
+# ``country = 'PH'`` and OSM inherits the Geofabrik extract). A hard
+# point-in-polygon test therefore drops coastal, reclaimed-land, port, and
+# small-island establishments from Overture *only*, which biases source_count
+# and evidence_tier downwards exactly along the coastline. This tolerance
+# (~0.002 deg, roughly 220 m) restores that band. Ocean-only tiles are already
+# removed upstream by ``filter_tiles_to_boundary``.
+OVERTURE_LAND_TOLERANCE_DEG = 0.002
+
 FSQ_LICENSE = "Apache-2.0"
 OSM_LICENSE = "ODbL-1.0"
 OVERTURE_APACHE_LICENSE = "Apache-2.0"
@@ -265,7 +283,10 @@ def prepare_osm(
     )
     name_norm = _sql_name_norm("name")
 
-    # ST_Centroid turns polygons/lines into one representative POI coordinate.
+    # ST_PointOnSurface turns polygons/lines into one representative POI
+    # coordinate that is *guaranteed to lie inside the footprint*; a centroid
+    # can fall outside concave shapes such as U-shaped malls or ring-shaped
+    # markets. It is computed once per row rather than once per axis.
     # We are explicitly building a POINT dataset, so original OSM geometry is
     # not retained here.
     con.execute(
@@ -277,15 +298,19 @@ def prepare_osm(
                     CAST(osm_type AS VARCHAR) || '/' || CAST(osm_id AS VARCHAR) AS source_id,
                     CAST(name AS VARCHAR) AS name,
                     {category_expr} AS category,
-                    ST_X(ST_Centroid(geom))::DOUBLE AS lon,
-                    ST_Y(ST_Centroid(geom))::DOUBLE AS lat,
+                    ST_PointOnSurface(geom) AS rep_point,
                     NULL::VARCHAR AS provenance,
                     'ODbL-1.0'::VARCHAR AS upstream_license
                 FROM ST_Read('{seq.as_posix()}')
                 WHERE name IS NOT NULL AND trim(CAST(name AS VARCHAR)) <> ''
+            ), pointed AS (
+                SELECT * EXCLUDE (rep_point),
+                       ST_X(rep_point)::DOUBLE AS lon,
+                       ST_Y(rep_point)::DOUBLE AS lat
+                FROM raw
             ), norm AS (
                 SELECT *, {name_norm} AS name_norm
-                FROM raw
+                FROM pointed
             ), ready AS (
                 SELECT *,
                        array_to_string(list_sort(string_split(name_norm, ' ')), ' ') AS name_tokens,
@@ -317,9 +342,20 @@ def prepare_osm(
     return tiles_dir
 
 
+@lru_cache(maxsize=4096)
+def _osm_tile_files_cached(tiles_dir: Path, ix: int, iy: int) -> tuple[Path, ...]:
+    directory = tiles_dir / f"tile_x={ix}" / f"tile_y={iy}"
+    return tuple(sorted(directory.glob("*.parquet"))) if directory.exists() else ()
+
+
 def osm_tile_files(tiles_dir: Path, tile: Tile) -> list[Path]:
-    directory = tiles_dir / f"tile_x={tile.ix}" / f"tile_y={tile.iy}"
-    return sorted(directory.glob("*.parquet")) if directory.exists() else []
+    """Resolve the OSM partition files for one source tile.
+
+    Cached: matching resolves the same handful of tiles 48 times per 1-degree
+    block (16 child tiles x 3 source pairs), and each uncached call re-globbed
+    the directory.
+    """
+    return list(_osm_tile_files_cached(tiles_dir, tile.ix, tile.iy))
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +413,9 @@ def _stream_overture_tile(
     fragments intersecting the requested bbox. It also avoids loading the tile
     into GeoPandas or a Python list.
     """
+    from overturemaps import record_batch_reader
+    from overturemaps.writers import copy as overture_copy, get_writer
+
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".part")
 
@@ -488,7 +527,9 @@ def prepare_overture_boundary(
     con.execute(
         f"""
         COPY (
-            SELECT ST_MemUnion_Agg(geometry) AS geometry
+            SELECT ST_MemUnion_Agg(
+                       ST_SetCRS(geometry::GEOMETRY, '{CRS84}')
+                   ) AS geometry
             FROM read_parquet('{raw.as_posix()}')
             WHERE country = 'PH' AND subtype = 'country' AND is_land = true
         ) TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -558,6 +599,10 @@ def _overture_worker(
     scope_pred = bbox_sql("lon", "lat", scope_bboxes)
     tile_pred = _tile_sql("lon", "lat", tile)
     name_norm = _sql_name_norm("name")
+    tol = OVERTURE_LAND_TOLERANCE_DEG
+    tile_env = (
+        tile.west - tol, tile.south - tol, tile.east + tol, tile.north + tol,
+    )
 
     tmp = target.with_suffix(".parquet.part")
     tmp.unlink(missing_ok=True)
@@ -573,7 +618,7 @@ def _overture_worker(
                     ST_X(geometry)::DOUBLE AS lon,
                     ST_Y(geometry)::DOUBLE AS lat,
                     {provenance_expr} AS provenance,
-                    geometry
+                    ST_SetCRS(geometry::GEOMETRY, '{CRS84}') AS geometry
                 FROM read_parquet('{raw.as_posix()}')
                 WHERE names.primary IS NOT NULL {status_pred}
             ), norm AS (
@@ -588,12 +633,27 @@ def _overture_worker(
                 FROM norm
                 WHERE name_norm <> ''
             )
+            , land AS (
+                -- Clip the national multipolygon (thousands of islands) once
+                -- to this tile before testing any point against it. Testing
+                -- every point against the whole archipelago geometry is the
+                -- single most expensive predicate in source preparation.
+                SELECT ST_Intersection(
+                           b.geometry,
+                           ST_SetCRS(
+                               ST_MakeEnvelope({tile_env[0]}, {tile_env[1]},
+                                               {tile_env[2]}, {tile_env[3]}),
+                               '{CRS84}'
+                           )
+                       ) AS geometry
+                FROM read_parquet('{boundary.as_posix()}') b
+            )
             SELECT source, source_id, name, category, lon, lat, provenance, upstream_license,
                    name_norm, name_tokens
-            FROM ready, read_parquet('{boundary.as_posix()}') b
+            FROM ready, land
             WHERE {tile_pred}
               AND {scope_pred}
-              AND ST_Within(ready.geometry, b.geometry)
+              AND ST_DWithin(ready.geometry, land.geometry, {OVERTURE_LAND_TOLERANCE_DEG})
             ORDER BY lon, lat
         ) TO '{tmp.as_posix()}' (
             FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 25000
@@ -640,6 +700,8 @@ def prepare_overture(
 
 def _discover_fsq_release() -> str:
     """Find the newest release folder without listing every global Parquet file."""
+    from huggingface_hub import HfApi, get_token
+
     if not get_token():
         raise RuntimeError(
             "Foursquare requires one-time Hugging Face authorization. "
@@ -855,9 +917,21 @@ def prepare_foursquare(
     return out_dir
 
 
+@lru_cache(maxsize=4096)
+def _regular_source_tile_files_cached(source_dir: Path, key: str) -> tuple[Path, ...]:
+    path = source_dir / f"{key}.parquet"
+    return (path,) if valid_parquet(path) else ()
+
+
 def regular_source_tile_files(source_dir: Path, tile: Tile) -> list[Path]:
-    path = source_dir / f"{tile.key}.parquet"
-    return [path] if valid_parquet(path) else []
+    """Resolve the FSQ/Overture file for one source tile.
+
+    Cached for the same reason as :func:`osm_tile_files`: ``valid_parquet``
+    opens the Parquet footer, and matching asked the same question tens of
+    thousands of times per national run. Source tiles are immutable once the
+    acquisition stage has finished, which is the only time this is called.
+    """
+    return list(_regular_source_tile_files_cached(source_dir, tile.key))
 
 
 # ---------------------------------------------------------------------------
@@ -883,7 +957,10 @@ def filter_tiles_to_boundary(
         WITH t(ix,iy,w,s,e,n) AS (VALUES {values})
         SELECT DISTINCT t.ix, t.iy
         FROM t, read_parquet('{boundary.as_posix()}') b
-        WHERE ST_Intersects(ST_MakeEnvelope(w,s,e,n), b.geometry)
+        WHERE ST_Intersects(
+                  ST_SetCRS(ST_MakeEnvelope(w,s,e,n), '{CRS84}'),
+                  ST_SetCRS(b.geometry::GEOMETRY, '{CRS84}')
+              )
         """
     ).fetchall()
     con.close()

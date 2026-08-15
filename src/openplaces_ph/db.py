@@ -61,6 +61,13 @@ def connect(
         # subsequent runs load it from DuckDB's local extension cache.
         con.execute("INSTALL spatial; LOAD spatial;")
 
+        # DuckDB 1.5.5 enables this by default when spatial is present, but the
+        # public output contract is GeoParquet. Set it explicitly so that a
+        # changed local/global DuckDB setting cannot silently turn ``geometry``
+        # into an ordinary binary Parquet column. ``build_canonical`` performs a
+        # second footer-level check before publishing the final file.
+        con.execute("SET enable_geoparquet_conversion = true")
+
     if httpfs:
         con.execute("INSTALL httpfs; LOAD httpfs;")
 
