@@ -63,17 +63,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parallel match workers. Default 1 for the low-resource profile.",
     )
 
-    # The laptop has 16 GB installed RAM, but the pipeline intentionally claims
-    # only a small fraction of it. RAM capacity itself does not normally shrink
-    # with age; the headroom is for Windows, antivirus, filesystem cache, other
-    # applications, and the less predictable I/O/thermal behavior of aging hardware.
+    # Reference target: an aging Windows laptop with only 8 GB RAM.  The pipeline
+    # intentionally claims a small, predictable fraction of that memory.  The
+    # remaining headroom is for Windows, antivirus, filesystem cache, Python,
+    # browser/editor processes, and the less predictable I/O/thermal behaviour of
+    # old hardware.  Faster machines may opt into more workers explicitly.
     p.add_argument("--worker-memory", default="512MB", help="DuckDB cap per parallel worker.")
     p.add_argument("--main-memory", default="1GB", help="DuckDB cap for national single-process stages.")
     p.add_argument("--temp-dir", help="DuckDB spill directory. Prefer an SSD with >=20 GB free.")
 
     p.add_argument("--source-tile-deg", type=float, default=1.0, help="Remote/checkpoint block size.")
     p.add_argument("--match-tile-deg", type=float, default=0.25, help="Matching checkpoint size.")
-    p.add_argument("--max-distance", type=float, default=120.0, help="Maximum cross-source POI distance in meters.")
+    p.add_argument(
+        "--max-distance", type=float, default=120.0,
+        help=(
+            "Maximum cross-source POI distance in meters. The spatial blocking "
+            "grid and the name-score ladder are both derived from this value, "
+            "so non-default settings stay internally consistent."
+        ),
+    )
 
     p.add_argument(
         "--refresh-sources", action="store_true",
@@ -130,6 +138,8 @@ def main() -> None:
         raise SystemExit("worker counts must be at least 1")
     if args.source_tile_deg <= 0 or args.match_tile_deg <= 0:
         raise SystemExit("tile sizes must be positive")
+    if args.max_distance <= 0:
+        raise SystemExit("--max-distance must be positive")
     ratio = args.source_tile_deg / args.match_tile_deg
     if abs(ratio - round(ratio)) > 1e-9:
         raise SystemExit("--source-tile-deg must be an integer multiple of --match-tile-deg")
@@ -164,6 +174,17 @@ def main() -> None:
         f"Workers: Overture={args.overture_workers} | "
         f"Foursquare={args.fsq_workers} | match={args.match_workers}"
     )
+    match_cfg = MatchConfig(max_distance_m=args.max_distance)
+    print(
+        f"Matching: max distance {match_cfg.max_distance_m:g} m | "
+        f"blocking cell {match_cfg.grid_degrees:.6f}deg"
+    )
+    if args.max_distance > 120.0:
+        print(
+            "NOTE: the name-score ladder was calibrated at 120 m. Above that, "
+            "the widest band still requires a >= 0.94 name score, but the "
+            "false-match rate has not been validated."
+        )
     print(f"DuckDB caps: worker={args.worker_memory}, main={args.main_memory}")
     print(f"DuckDB spill directory: {temp_dir}")
     free = free_gb(temp_dir)
@@ -222,7 +243,6 @@ def main() -> None:
         if not (osm_dir / "_SUCCESS.json").exists() or not fsq_dir.exists() or not overture_dir.exists():
             raise RuntimeError("Source checkpoints are incomplete. Run --only sources first.")
 
-        match_cfg = MatchConfig(max_distance_m=args.max_distance)
         edge_root = root / "data" / "work" / scope.slug / "edges"
 
         if args.only in ("all", "match"):

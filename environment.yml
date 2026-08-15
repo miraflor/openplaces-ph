@@ -13,7 +13,7 @@ dependencies:
   # DuckDB is the workhorse for out-of-core Parquet filtering, joining,
   # sorting, and final aggregation. Large operations are explicitly allowed
   # to spill to disk by the code.
-  - duckdb>=1.4,<2
+  - duckdb=1.5.5
   - numpy
   - pyarrow
   - pyyaml

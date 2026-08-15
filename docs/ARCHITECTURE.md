@@ -1,123 +1,302 @@
 # OpenPlaces PH architecture
 
-OpenPlaces PH is designed around a simple constraint: **a nationwide data pipeline should finish reliably on modest hardware without requiring the entire Philippines to fit in RAM.**
+OpenPlaces PH is built around one practical constraint:
 
-The implementation is therefore disk-first, tiled, checkpointed, and intentionally conservative about parallelism.
+> **A nationwide place-reconciliation pipeline should finish reliably on a modest 8 GB laptop without requiring the Philippines to fit in RAM.**
 
-## Pipeline
+That constraint drives nearly every implementation choice: tiling, Parquet checkpoints, conservative parallelism, out-of-core DuckDB operations, narrow national sorts, and compact clustering state.
+
+## 1. Pipeline at a glance
 
 ```text
-Geofabrik OSM PBF ---------> normalize/partition ----\
-                                                    \
-Overture Places -----------> normalize/partition -----+--> pairwise match shards
-                                                      |         |
-Foursquare OS Places ------> normalize/partition -----/         v
-                                                           ranked links
-                                                               |
-                                                               v
-                                                     constrained clustering
-                                                               |
-                                                               v
-                                                     canonical GeoParquet points
+Geofabrik OSM PBF ----------> filter / normalize / partition ---\
+                                                              \
+Overture Places ------------> normalize / partition ------------+--> pairwise match shards
+                                                                |          |
+Foursquare OS Places -------> normalize / partition ------------/          v
+                                                                    accepted links
+                                                                          |
+                                                                          v
+                                                                    narrow ranking
+                                                                          |
+                                                                          v
+                                                               constrained union-find
+                                                                          |
+                                                                          v
+                                                              canonical GeoParquet points
 ```
 
-## Durable work units
+There are deliberately two notions of “done”:
 
-| Stage | Durable unit | Typical loss after interruption |
-|---|---|---|
-| Geofabrik OSM download | HTTP byte-range `.part` file | only bytes not yet committed |
-| OSM filter/export | one local stage | current local stage |
-| Overture acquisition | 1-degree tile | current tile |
-| Foursquare acquisition | 1-degree tile | current tile |
-| Pairwise matching | 0.25-degree tile x source pair | current match shard |
-| Greedy clustering | ranked-edge row group | current row group |
+- **local durable work**: source tiles, match shards, union-find snapshots;
+- **public output**: observations, accepted match edges, canonical points, and summary.
 
-Completed files are written to temporary `.part` paths and promoted only after successful completion.
+A crash should cost only the current durable unit, not the entire country.
 
-## Memory policy
+---
 
-The defaults deliberately reserve most machine memory for Windows, filesystem cache, antivirus, and other applications:
+## 2. Memory policy
 
-- DuckDB source/match worker: **512 MB**
-- DuckDB national/final stage: **1 GB**
-- DuckDB threads per connection: **1**
-- Overture workers: **1**
-- Foursquare workers: **2**
-- match workers: **1**
+Default DuckDB limits are small on purpose:
 
-DuckDB may spill large sorts and joins to `--temp-dir`. An SSD is preferred.
+- worker connection: **512 MB**;
+- national/final connection: **1 GB**;
+- DuckDB threads per connection: **1**;
+- Overture workers: **1**;
+- Foursquare workers: **2**;
+- match workers: **1**.
 
-The pipeline avoids national Pandas and GeoPandas materialization. Python mainly orchestrates durable units; DuckDB, Osmium, Arrow, and Parquet do the heavy work.
+DuckDB can spill joins and sorts to `--temp-dir`. The code never materializes a national Pandas or GeoPandas table.
 
-## Source acquisition
+### Why not use all eight logical CPU threads?
+
+On an old laptop, CPU, RAM, disk bandwidth, filesystem cache, antivirus, and thermal throttling are coupled. More workers can make every worker slower while also increasing out-of-memory and paging risk. The defaults therefore leave concurrency to the stages that benefit most from overlapping remote latency.
+
+---
+
+## 3. Source acquisition
 
 ### OpenStreetMap
 
-The Philippines `.osm.pbf` is downloaded once from Geofabrik. Osmium filters named objects carrying POI-relevant keys and exports only the required attributes. The result is partitioned into source tiles.
+The national Geofabrik PBF is downloaded once with HTTP byte-range resume. Osmium performs the large PBF filtering outside Python, keeping only named objects carrying POI-relevant keys.
 
-OSM polygons and lines are reduced to point coordinates because OpenPlaces PH's canonical product is intentionally a point layer.
+The filtered geometry is exported to GeoJSONSeq and converted to partitioned Parquet. Because the product is intentionally a **point registry**, lines and polygons are reduced using `ST_PointOnSurface`. Unlike a centroid, this representative point remains on the original geometry.
 
-### Overture
+### Overture Maps
 
-The Overture client streams one bounded tile at a time from a pinned release. A Philippine `division_area` land polygon from that same release is cached and used to remove ocean-only source tiles and clip returned Places to Philippine land.
+The code resolves one Overture release and pins it in cache metadata. Every resumed Overture tile therefore comes from the same snapshot.
 
-Overture's raw `sources` provenance is preserved. Provider-level license metadata is inferred conservatively from that provenance.
+A country land geometry from that same release serves two purposes:
+
+1. remove 1-degree tiles that are entirely ocean;
+2. reject clearly offshore place points.
+
+Strict point-in-polygon containment would affect Overture only, because Foursquare uses `country='PH'` and OSM comes from Geofabrik. That asymmetry would systematically depress source counts on reclaimed land, ports, piers, and small/coastal geometries. The Overture test therefore uses a small tolerance.
+
+All Overture boundary operations explicitly use **`OGC:CRS84`**, where X is longitude and Y is latitude. This avoids silent CRS ambiguity after DuckDB 1.5 introduced CRS-aware geometry types.
 
 ### Foursquare
 
-DuckDB queries the authenticated Hugging Face Parquet dataset remotely. Both `country='PH'` and geographic bounds are applied so the pipeline does not materialize the global Foursquare dataset.
+Foursquare OS Places is queried through authenticated Hugging Face Parquet. `country='PH'` and coordinate bounds are both applied, so only relevant row groups are transferred/materialized.
 
-## Matching strategy
+Heavy acquisition libraries are imported lazily. Merely asking for `openplaces --help` or `--status` does not import Overture and Hugging Face client stacks.
 
-Matching is source-pair specific:
+---
+
+## 4. Durable work units
+
+| Stage | Durable unit | Normal loss after interruption |
+|---|---|---|
+| OSM national download | `.part` byte range | only uncommitted bytes |
+| OSM local preparation | local stage | current local stage |
+| Overture | 1-degree tile | current tile |
+| Foursquare | 1-degree tile | current tile |
+| Pairwise matching | 0.25-degree tile × source pair | current shard |
+| Union-find | transactional snapshot | row groups after last snapshot |
+
+Output files are written to temporary `.part` paths and renamed only after successful completion.
+
+---
+
+## 5. Matching
+
+Matching is pairwise across sources:
 
 ```text
-Foursquare <-> Overture
-Foursquare <-> OSM
-Overture   <-> OSM
+FSQ <-> Overture
+FSQ <-> OSM
+Overture <-> OSM
 ```
 
-For each 0.25-degree core tile:
+For one 0.25-degree core tile:
 
-1. read only touching 1-degree source files;
-2. extend the comparison side with a small spatial halo;
-3. use a coarse numeric coordinate grid to generate nearby candidates;
-4. calculate exact Haversine distance;
-5. discard candidates beyond the configured maximum distance;
-6. compare normalized name and sorted-name tokens with Jaro-Winkler similarity;
-7. use category similarity as weak supporting evidence; and
-8. apply conservative distance-dependent acceptance thresholds.
+1. the left source is read only inside the core;
+2. the right source is read from the core plus a distance halo;
+3. each observation gets a numeric grid cell;
+4. only the 3×3 neighborhood is joined;
+5. cheap latitude/longitude separation bounds reject impossible pairs;
+6. Haversine distance is computed for the survivors;
+7. pairs beyond `max_distance_m` are discarded;
+8. normalized name and sorted-token strings are scored with Jaro-Winkler;
+9. distance-dependent thresholds decide whether the edge exists;
+10. category similarity contributes only 2% of the final ranking score.
 
-Generic labels such as `ATM`, `Bank`, or `Clinic` require near-exact agreement at very short distances.
+### 5.1 Blocking cell size is derived
 
-## Constrained clustering
+A 3×3 neighbor join only guarantees coverage to one cell width. A hard-coded cell would therefore make some `--max-distance` values incorrect.
 
-Accepted candidate links are sorted strongest-first. A compact union-find data structure greedily joins observations subject to one crucial constraint:
+`MatchConfig.grid_degrees` is derived from the requested radius using a conservative longitude scale at the northern edge of the Philippines plus a small safety factor. The tests sweep bearings, sub-cell positions, several distances, and Philippine latitudes to verify that an in-range pair never lands more than one grid cell apart.
 
-> A canonical cluster may contain at most one Foursquare observation, one Overture observation, and one OSM observation.
+### 5.2 Cheap bounds before Haversine
 
-This prevents transitive matching from collapsing multiple same-source branches in dense locations such as malls.
+Grid neighbors form a square, while the desired search region is a circle. Many joined pairs can be rejected using only:
 
-The union-find uses compact NumPy arrays and is transactionally snapshotted between ranked-edge row groups. If the process stops, the last completed snapshot remains valid.
+```text
+abs(delta_lat) <= safe_lat_bound
+abs(delta_lon) <= safe_lon_bound
+```
 
-## Canonical record construction
+before evaluating trigonometric functions. This is a strict superset of the search circle, so it improves performance without changing recall.
 
-For each final cluster:
+### 5.3 One acceptance calibration
 
-- canonical coordinates are the median longitude and latitude;
-- canonical name/category use explicit source priority;
-- each original source ID/name/category is retained;
+The model uses this default piecewise rule:
+
+| Distance interval | Minimum Jaro-Winkler name score |
+|---|---:|
+| 0–20 m | 0.70 |
+| 20–50 m | 0.82 |
+| 50–90 m | 0.90 |
+| >90 m | 0.94 |
+
+The configured radius merely truncates the final interval. A 60 m run therefore ends with `50–60 m -> 0.90`; it does not import the 0.94 threshold from the >90 m interval.
+
+`acceptance_bands()` is the single source of truth. Both `accept_pair()` and the SQL `CASE` are generated from it and tested against each other.
+
+Generic/short names have a separate stricter rule, but even that rule cannot exceed the global `max_distance_m`.
+
+---
+
+## 6. Finalization without a huge national sort
+
+Accepted edge shards contain wide fields: source IDs, scores, distances, provenance-related flags, and strings.
+
+Clustering only needs a ranked `(left_id, right_id)` pair. Finalization therefore splits the work:
+
+```text
+edge shards
+   |
+   v
+edge_ids.parquet      # wide, unsorted, dense observation IDs attached
+   |
+   +-------------------------------> later audit/output join
+   |
+   v
+ranked_pairs.parquet  # only two int64 columns, globally sorted by edge strength
+   |
+   v
+union-find
+```
+
+The expensive national sort carries only the pair. Tie-breaking still uses stable upstream source IDs before those strings are discarded, keeping clustering deterministic when dense row IDs are rebuilt.
+
+### Edge-resolution invariant
+
+Every accepted source edge must resolve to exactly one observation on each side. After `edge_ids.parquet` is written, metadata row counts are compared with the sum of accepted source-edge rows. A mismatch means a source ID was missing or duplicated and finalization aborts instead of silently changing the graph.
+
+---
+
+## 7. Dense observation IDs without a national window
+
+A single filtered staging Parquet file is written first. It is then re-read with DuckDB's `file_row_number=true` to attach dense IDs `0..n-1`.
+
+This deliberately avoids `row_number() OVER ()`, which can route the national table through a window operator and increase memory/spill pressure.
+
+---
+
+## 8. Constrained union-find
+
+Edges are processed strongest-first. A union is rejected if the two components already contain the same source.
+
+The source mask uses three bits:
+
+```text
+1 = Foursquare
+2 = Overture
+4 = OSM
+```
+
+If:
+
+```text
+mask[root_a] & mask[root_b] != 0
+```
+
+then the merge would create a canonical entity with duplicate observations from at least one source and is rejected.
+
+### 8.1 The state is genuinely compact in RAM
+
+The national implementation uses:
+
+- `array('I')` parent: 4 bytes/observation;
+- `bytearray` rank: 1 byte/observation;
+- `bytearray` source mask: 1 byte/observation.
+
+So the base working state is about **6 bytes per observation**.
+
+A Python `list[int]` was deliberately rejected. Although it can be fast for scalar access, each list slot points to a Python integer object and the real memory footprint becomes tens of bytes per observation.
+
+The code refuses to run if the platform's `array('I')` is not four bytes or if the observation count reaches `2^32`, rather than silently widening the representation and violating the memory contract.
+
+### 8.2 Transactional resume
+
+A committed checkpoint contains:
+
+```text
+parent:uint32
+rank:uint8
+mask:uint8
+completed_row_group:int64
+input signature
+```
+
+It is written to a temporary file, fsynced, then atomically promoted. A crash cannot mutate the previous committed checkpoint. Replaying later ranked-edge row groups is deterministic.
+
+### 8.3 Final path compression
+
+The compact parent buffer is exposed to NumPy as a zero-copy `uint32` view. Pointer doubling compresses the forest with one temporary `uint32` vector rather than converting the entire national parent array to `int64`.
+
+---
+
+## 9. Transitivity is instrumented
+
+The algorithm does not require triangle closure.
+
+A triple can be formed by:
+
+```text
+FSQ <-> Overture
+Overture <-> OSM
+```
+
+without an accepted FSQ↔OSM edge.
+
+The canonical output therefore includes:
+
+- `completed_transitively`: true when a three-source cluster has fewer internal accepted links than its three possible pairs;
+- `cluster_max_pair_distance_m`: greatest distance between any two observations in that cluster.
+
+Strict triangle closure is intentionally not imposed yet. The diagnostics let empirical runs show how much a stricter future mode would affect recall.
+
+---
+
+## 10. Canonical record construction
+
+For each cluster:
+
+- coordinates are the median longitude and latitude;
+- name/category use explicit source priority;
+- every source's original ID/name/category is retained;
 - Overture provenance is retained;
-- source-specific license metadata is retained;
-- `source_count` records observed source-layer coverage; and
-- `known_independent_source_count` discounts the visible Foursquare-inside-Overture provenance case.
+- source-specific license fields are retained;
+- `source_count` records source-layer coverage;
+- `known_independent_source_count` discounts the visible Overture-from-Foursquare case;
+- transitivity diagnostics are retained.
 
-Evidence tiers (`single`, `double`, `triple`) describe source coverage only. They are not calibrated probabilities.
+The geometry is written as a CRS-aware point:
 
-## Licensing architecture
+```text
+OGC:CRS84
+```
 
-OpenPlaces PH keeps software licensing and data licensing separate.
+Before the temporary canonical file is promoted, PyArrow checks for the GeoParquet `geo` metadata key. If it is absent, finalization fails loudly.
 
-The source code is MIT-licensed. Normalized observations carry an `upstream_license` field, and canonical records expose per-source license fields. Overture's provider-dependent licensing is inferred from its preserved source provenance, with unknown or mixed future cases marked `UNKNOWN` or `MIXED/REVIEW` rather than guessed.
+---
 
-See `DATA_LICENSES.md` for release guidance.
+## 11. Licensing architecture
+
+The repository software is MIT-licensed. Generated data inherit obligations from their upstream records and are not automatically MIT data.
+
+Normalized observations therefore carry `upstream_license`; canonical rows expose source-specific license fields. Unknown or mixed Overture provider provenance is marked conservatively rather than guessed.
+
+See [`../DATA_LICENSES.md`](../DATA_LICENSES.md).

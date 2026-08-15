@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openplaces-ph"
-version = "0.1.0"
+version = "0.2.0"
 description = "Open, provenance-aware Philippine places and establishment data built by triangulating multiple open geospatial sources."
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "OpenPlaces PH contributors"}]
 dependencies = [
-    "duckdb>=1.4,<2",
+    "duckdb==1.5.5",
     "numpy",
     "pyarrow",
     "PyYAML",
