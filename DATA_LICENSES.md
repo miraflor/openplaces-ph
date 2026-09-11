@@ -74,7 +74,7 @@ As documented by Overture in 2026, current Places providers include:
 | Foursquare | Apache-2.0 |
 | AllThePlaces | CC0-1.0 |
 
-OpenPlaces PH preserves the raw Overture `sources` provenance string and derives an `upstream_license` value conservatively:
+OpenPlaces PH preserves the raw Overture `sources` provenance string and derives an `upstream_license` value conservatively. Only the `dataset` values of that provenance are compared with the provider names; record ids and timestamps are ignored, because a provider pattern such as `dac` can otherwise match characters inside a record id. The value is re-derived at every finalization, so a corrected rule applies without downloading Overture again:
 
 ```text
 Foursquare provenance                 -> Apache-2.0
@@ -111,7 +111,7 @@ These fields are provenance metadata. They are not themselves a legal conclusion
 
 Before a public data release:
 
-1. record the exact Foursquare, Overture, and OSM source snapshots used;
+1. record the exact Foursquare, Overture, and OSM source snapshots used (`summary.json` → `sources`);
 2. retain source IDs and provenance fields;
 3. retain required copyright/license notices;
 4. provide OpenStreetMap attribution where OSM data are used;

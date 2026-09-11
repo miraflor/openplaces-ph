@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openplaces-ph"
-version = "0.2.0"
+version = "0.2.1"
 description = "Open, provenance-aware Philippine places and establishment data built by triangulating multiple open geospatial sources."
 requires-python = ">=3.11"
 license = {text = "MIT"}

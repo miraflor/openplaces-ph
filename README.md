@@ -210,12 +210,14 @@ You may press `Ctrl+C` and rerun the same command later. Completed durable units
 
 | Stage | Durable unit |
 |---|---|
-| Geofabrik download | byte-resumable `.part` file |
+| Geofabrik download | byte-resumable `.part` file, resumed only while the upstream file is unchanged (`If-Range`) |
 | OSM preparation | local stage / final partitioned cache |
-| Overture | 1-degree tile |
-| Foursquare | 1-degree tile |
+| Overture | 1-degree tile of the pinned release |
+| Foursquare | 1-degree tile of the pinned release |
 | Pairwise matching | 0.25-degree tile × source pair |
 | Final clustering | transactional union-find snapshot |
+
+Stages may also run in different sessions (`--only sources`, later `--only match`, later `--only finalize`). Each stage checks that the stage before it is complete and belongs to the same source snapshot. If not, it stops with an `ERROR:` line that names the command to run; it never builds on partial or older input.
 
 Check progress without starting work:
 
@@ -353,6 +355,8 @@ The project prefers a loud failure over silently publishing a subtly corrupted r
 Examples include:
 
 - an HTTP download whose received length does not match the expected length;
+- matching or finalization started while a source tile is missing, or while a source directory still holds tiles of another release;
+- finalization started while matching is unfinished, or while the match shards were built from another source snapshot;
 - an accepted match edge that cannot resolve to exactly one observation on both sides;
 - a union-find run too large for its explicitly 32-bit compact parent representation;
 - a canonical Parquet file whose footer lacks GeoParquet `geo` metadata.
@@ -379,17 +383,22 @@ Put `--temp-dir` on the fastest disk with the most free space.
 
 A multi-session run must not silently mix source vintages.
 
-- Overture release metadata is pinned in the local cache.
-- Foursquare release metadata is pinned in the local cache.
-- The downloaded OSM PBF is reused until `--refresh-sources` is requested.
+- Overture and Foursquare releases are pinned in the local cache. Each normalized source directory records the release its tiles belong to (`_release.json`); when the pinned release changes, the old tiles are discarded before any new tile is written.
+- The downloaded OSM PBF is reused until `--refresh-sources` is requested, and the OSM tile cache records which PBF version it was built from.
+- These three identities form the **source snapshot**. It is stored beside the match shards, and matching rebuilds its shards automatically when the snapshot changes. Finalization refuses match shards from another snapshot.
 - Matching configuration is fingerprinted beside its durable edge shards.
 - Finalization records its dependency configuration and invalidates downstream checkpoints when that contract changes.
+- `summary.json` records the source snapshot of the published outputs.
 
-To deliberately acquire fresh source snapshots:
+To acquire fresh source snapshots:
 
 ```powershell
-openplaces --scope philippines --refresh-sources --temp-dir D:\openplaces-temp
+openplaces --scope philippines --refresh-sources --only sources --temp-dir D:\openplaces-temp
 ```
+
+`--refresh-sources` pins the newest upstream releases. A source is downloaded again only if its release (or, for OSM, the Geofabrik file) has changed. If the refresh is interrupted, the next run continues it, with or without the flag. Afterwards, `--only match` and `--only finalize` rebuild what the new snapshot requires; no rebuild flag is needed.
+
+The pinned releases in `data/cache/` are shared by all scopes. A refresh during a `--areas` test run therefore also means that the next national run downloads the new release for its own tiles. To force a new download of one source without a new release, delete its directory under `data/sources/<scope>/`.
 
 ---
 
@@ -405,6 +414,13 @@ openplaces --help
 
 The test suite covers, among other things:
 
+- the real candidate-matching SQL against an all-pairs brute-force oracle, across block and match-tile edges;
+- stop/resume across sessions: refused incomplete sources, unfinished matching, and stale match shards; automatic rebuilds after a source refresh;
+- download resume with `If-Range` against a local server that replaces its file between requests;
+- OSM preparation with real Osmium (skipped when `osmium` is not installed);
+- Overture normalization, including points on tile edges and the coastal land tolerance;
+- Overture licence classification from provider dataset names;
+- parity between the SQL name normalizer and its Python mirror;
 - spatial-blocking recall across Philippine latitudes;
 - SQL/Python threshold parity at several radii;
 - the correct piecewise calibration when a radius is truncated;
@@ -418,7 +434,7 @@ The test suite covers, among other things:
 - GeoParquet metadata; and
 - lazy loading of the heavy acquisition clients.
 
-CI runs the same tests on Python 3.11.
+CI runs the same tests on Python 3.11, with Osmium installed so that the OSM preparation test runs too.
 
 ---
 
@@ -445,7 +461,8 @@ openplaces-ph/
 │   ├── ARCHITECTURE.md
 │   ├── CODE_WALKTHROUGH.md
 │   ├── DATA_DICTIONARY.md
-│   └── REVIEW-2026-08.md
+│   ├── REVIEW-2026-08.md
+│   └── REVIEW-2026-09.md
 ├── src/openplaces_ph/
 │   ├── __init__.py
 │   ├── cli.py
@@ -453,6 +470,7 @@ openplaces-ph/
 │   ├── db.py
 │   ├── finalize.py
 │   ├── matching.py
+│   ├── snapshot.py
 │   ├── sources.py
 │   ├── tiles.py
 │   └── util.py
