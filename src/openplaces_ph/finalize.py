@@ -26,10 +26,18 @@ import pyarrow.parquet as pq
 
 from .config import Scope, bbox_sql
 from .db import connect
-from .matching import EARTH_RADIUS_M
-from .sources import CRS84, osm_tile_files, regular_source_tile_files
+from .matching import EARTH_RADIUS_M, MANIFEST_NAME, match_checkpoints_complete
+from .snapshot import PipelineStateError, source_snapshot
+from .sources import (
+    CRS84,
+    clear_tile_file_caches,
+    osm_tile_files,
+    overture_fsq_provenance_sql,
+    overture_license_sql,
+    regular_source_tile_files,
+)
 from .tiles import Tile
-from .util import atomic_json, quote_paths, valid_parquet
+from .util import atomic_json, quote_paths, read_json, valid_parquet
 
 SOURCE_CODE = {"fsq": 1, "overture": 2, "osm": 4}
 SOURCE_PRIORITY = {"fsq": 0, "overture": 1, "osm": 2}
@@ -49,6 +57,10 @@ EDGE_ID_SCHEMA = pa.schema([
 ])
 
 RANKED_PAIR_SCHEMA = pa.schema([("left_id", pa.int64()), ("right_id", pa.int64())])
+
+# Bump when finalization logic changes so existing final checkpoints rebuild.
+# 4: Overture licences are re-derived here from provenance (dataset names only).
+FINALIZE_VERSION = 4
 
 # One transactional snapshot per minute of clustering work. The previous
 # per-row-group cadence wrote ~10 bytes x n_observations for every 100k edges,
@@ -71,6 +83,28 @@ def assert_geoparquet(path: Path) -> None:
             "Canonical output has a geometry column but no GeoParquet 'geo' metadata. "
             "This usually means the DuckDB spatial/GeoParquet writer behaviour changed."
         )
+
+
+def _add_geo_metadata_if_empty(path: Path) -> None:
+    """Give an empty canonical file the GeoParquet metadata DuckDB leaves out.
+
+    DuckDB 1.5.5 writes the ``geo`` key only when at least one geometry was
+    written, so an area without any POI failed :func:`assert_geoparquet`.
+    GeoParquet 1.0 allows an empty ``geometry_types`` list ("unknown"), and an
+    absent ``crs`` means OGC:CRS84, which is the contract here. Non-empty files
+    are left alone, so the strict check still detects a real writer change.
+    """
+    parquet = pq.ParquetFile(path)
+    if parquet.metadata.num_rows != 0 or b"geo" in (parquet.schema_arrow.metadata or {}):
+        return
+    table = parquet.read()
+    metadata = dict(table.schema.metadata or {})
+    metadata[b"geo"] = json.dumps({
+        "version": "1.0.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "geometry_types": []}},
+    }).encode("utf-8")
+    pq.write_table(table.replace_schema_metadata(metadata), path, compression="zstd")
 
 
 class UnionFindMask:
@@ -194,6 +228,16 @@ def build_observations(
         raise RuntimeError("No source Parquet files were found.")
 
     scope_pred = bbox_sql("lon", "lat", scope.bboxes)
+    # The Overture licence is re-derived from provenance here rather than
+    # trusted from the source tile. Tiles keep the label computed when they
+    # were downloaded; deriving it at finalization means a corrected licence
+    # rule applies at the next finalize, without downloading Overture again.
+    projection = ", ".join(
+        f"CASE WHEN source = 'overture' THEN {overture_license_sql('provenance')} "
+        "ELSE upstream_license END AS upstream_license"
+        if column == "upstream_license" else column
+        for column in OBSERVATION_COLUMNS
+    )
     stage = out_path.with_suffix(".stage.parquet")
     tmp = out_path.with_suffix(".parquet.part")
     stage.unlink(missing_ok=True)
@@ -205,7 +249,7 @@ def build_observations(
         con.execute(
             f"""
             COPY (
-                SELECT {', '.join(OBSERVATION_COLUMNS)}
+                SELECT {projection}
                 FROM ( {' UNION ALL '.join(parts)} )
                 WHERE name IS NOT NULL AND trim(name) <> ''
                   AND source_id IS NOT NULL
@@ -628,6 +672,7 @@ def build_canonical(
     canonical_path.unlink(missing_ok=True)
     tmp = canonical_path.with_suffix(".parquet.part")
     tmp.unlink(missing_ok=True)
+    fsq_in_overture = overture_fsq_provenance_sql("overture_provenance")
     con = connect(temp_dir / "canonical", memory_limit=memory_limit, threads=1, spatial=True)
     try:
         con.execute(
@@ -702,7 +747,7 @@ def build_canonical(
                         source_count - CASE
                             WHEN fsq_id IS NOT NULL
                              AND overture_id IS NOT NULL
-                             AND regexp_matches(lower(coalesce(overture_provenance,'')), 'foursquare|\\\\bfsq\\\\b')
+                             AND {fsq_in_overture}
                             THEN 1 ELSE 0 END AS known_independent_source_count,
                         CASE source_count
                             WHEN 1 THEN 'single'
@@ -719,7 +764,7 @@ def build_canonical(
                          AND coalesce(ms.internal_link_count, 0)
                              < source_count * (source_count - 1) / 2) AS completed_transitively,
                         (fsq_id IS NOT NULL AND overture_id IS NOT NULL
-                         AND regexp_matches(lower(coalesce(overture_provenance,'')), 'foursquare|\\\\bfsq\\\\b'))
+                         AND {fsq_in_overture})
                             AS overture_has_foursquare_provenance,
                         fsq_id, fsq_name, fsq_category, fsq_license,
                         overture_id, overture_name, overture_category, overture_provenance, overture_license,
@@ -741,6 +786,7 @@ def build_canonical(
     # DuckDB 1.5.5 writes GeoParquet metadata when a CRS-aware GEOMETRY column is
     # exported with the spatial extension loaded.  If that ever changes, stop
     # rather than publishing an ambiguously typed binary geometry column.
+    _add_geo_metadata_if_empty(tmp)
     assert_geoparquet(tmp)
     os.replace(tmp, canonical_path)
     return canonical_path
@@ -753,9 +799,14 @@ def write_summary(
     out_path: Path,
     temp_dir: Path,
     memory_limit: str,
+    sources: dict | None = None,
 ) -> dict:
     """Summarize the run using the same constrained DuckDB policy as every
-    other stage, in two passes instead of five separate table scans."""
+    other stage, in two passes instead of five separate table scans.
+
+    ``sources`` is the source snapshot the outputs were built from. Recording
+    it here is step 1 of the publication checklist in DATA_LICENSES.md.
+    """
     con = connect(temp_dir / "summary", memory_limit=memory_limit, threads=1)
     try:
         obs_n, edges_n, kept_n = con.execute(
@@ -788,8 +839,11 @@ def write_summary(
         "accepted_links_within_final_cluster": int(kept_n),
         "canonical_pois": int(canonical_n),
         "canonical_pois_completed_transitively": int(transitive_n),
-        "evidence_tiers": {str(k): int(v) for k, v in dict(tiers).items()},
+        # map_from_entries() returns NULL for an empty canonical layer.
+        "evidence_tiers": {str(k): int(v) for k, v in dict(tiers or {}).items()},
     }
+    if sources is not None:
+        payload["sources"] = sources
     atomic_json(out_path, payload)
     return payload
 
@@ -808,22 +862,51 @@ def finalize(
 ) -> dict:
     out = root / "data" / "output" / scope.slug
     work = root / "data" / "work" / scope.slug / "finalize"
+
+    # Finalization must consume exactly one snapshot: the current, complete
+    # sources *and* match shards built from those same sources. Each check
+    # below used to be missing, so an interrupted or stale upstream stage
+    # produced a plausible-looking but partial canonical layer.
+    clear_tile_file_caches()
+    snapshot = source_snapshot(root, source_tiles, fsq_dir, overture_dir, osm_dir)
+    edge_cfg = read_json(edge_root / MANIFEST_NAME)
+    if edge_cfg is None:
+        raise PipelineStateError("Match checkpoints are missing. Run `openplaces --only match` first.")
+    if edge_cfg.get("sources") != snapshot:
+        reason = (
+            "were written by <= 0.2.0, before source snapshots were recorded"
+            if "sources" not in edge_cfg
+            else "were built from a different source snapshot than the current sources"
+        )
+        raise PipelineStateError(
+            f"Match checkpoints {reason}. Run `openplaces --only match` (it rebuilds them) "
+            "before finalizing."
+        )
+    if not match_checkpoints_complete(edge_root):
+        raise PipelineStateError(
+            "Matching has not finished for the current configuration and sources. "
+            "Run `openplaces --only match` to complete it before finalizing."
+        )
+
     out.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
 
-    edge_cfg = edge_root / "_config.json"
+    # ``edge_config`` contains the source snapshot, so a source refresh always
+    # changes this payload and rebuilds every final checkpoint.
     dependency_payload = {
-        "edge_config": json.loads(edge_cfg.read_text(encoding="utf-8")) if edge_cfg.exists() else None,
+        "edge_config": edge_cfg,
         "source_tiles": [t.key for t in source_tiles],
-        "finalize_version": 3,
+        "finalize_version": FINALIZE_VERSION,
     }
     dep_path = work / "_dependencies.json"
-    if dep_path.exists() and not rebuild:
-        try:
-            previous = json.loads(dep_path.read_text(encoding="utf-8"))
-        except Exception:
-            previous = None
-        if previous != dependency_payload:
+    previous = read_json(dep_path)
+    if not rebuild:
+        if previous is None:
+            if any(p.exists() for p in (out / "observations.parquet", work / "edge_ids.parquet",
+                                        work / "clusters.parquet", out / "canonical_pois.parquet")):
+                print("[finalize] final checkpoints have no readable dependency record; rebuilding them")
+                rebuild = True
+        elif previous != dependency_payload:
             print("[finalize] upstream configuration changed; rebuilding final checkpoints")
             rebuild = True
 
@@ -862,4 +945,5 @@ def finalize(
     )
     return write_summary(
         canonical, observations, match_edges, out / "summary.json", temp_dir, memory_limit,
+        sources=snapshot,
     )

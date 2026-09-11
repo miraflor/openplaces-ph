@@ -8,15 +8,16 @@ from pathlib import Path
 
 from .config import load_area_config, resolve_scope
 from .finalize import finalize
-from .matching import MatchConfig, prepare_matches
+from .matching import MatchConfig, match_checkpoints_complete, prepare_matches
+from .snapshot import PipelineStateError, dir_release, pinned_release
 from .sources import (
     check_external_tools,
     filter_tiles_to_boundary,
+    pin_overture_release,
     prepare_foursquare,
     prepare_osm,
     prepare_overture,
     prepare_overture_boundary,
-    resolve_overture_release,
     source_tiles_for_scope,
 )
 from .tiles import child_tiles, intersects
@@ -85,7 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--refresh-sources", action="store_true",
-        help="Fetch a fresh source snapshot; invalidates matching/final outputs.",
+        help=(
+            "Pin the newest upstream releases. Only sources whose release changed are "
+            "downloaded again; matching and final outputs rebuild automatically when the "
+            "source snapshot changes. An interrupted refresh continues on the next run."
+        ),
     )
     p.add_argument("--rebuild-match", action="store_true", help="Discard and recompute match checkpoints only.")
     p.add_argument("--rebuild-finalize", action="store_true", help="Rebuild final clustering/output only.")
@@ -122,11 +127,20 @@ def _status(root: Path, scope, source_tiles, source_tile_deg: float, match_tile_
     expected_edges = expected_match_tiles * 3
 
     out = root / "data" / "output" / scope.slug
+    def releases(source: str, directory: Path) -> str:
+        pinned, bound = pinned_release(root, source), dir_release(directory)
+        if pinned is None:
+            return "no release pinned yet"
+        if bound is None or bound == pinned:
+            return f"pinned {pinned}"
+        return f"pinned {pinned}, tiles still from {bound} (refresh not finished)"
+
     print(f"Scope: {scope.name}")
     print(f"OSM normalized cache: {'ready' if osm_ok else 'not ready'}")
-    print(f"Overture 1° blocks: {ov_n}/{len(source_tiles)}")
-    print(f"Foursquare 1° blocks: {fsq_n}/{len(source_tiles)}")
-    print(f"Match checkpoints: {edge_n}/{expected_edges}")
+    print(f"Overture 1° blocks: {ov_n}/{len(source_tiles)} ({releases('overture', overture)})")
+    print(f"Foursquare 1° blocks: {fsq_n}/{len(source_tiles)} ({releases('fsq', fsq)})")
+    print(f"Match checkpoints: {edge_n}/{expected_edges}"
+          f"{' (complete)' if match_checkpoints_complete(edge_root) else ''}")
     for name in ("observations.parquet", "match_edges.parquet", "canonical_pois.parquet", "summary.json"):
         print(f"{name}: {'ready' if (out / name).exists() else 'not ready'}")
 
@@ -199,8 +213,14 @@ def main() -> None:
     check_external_tools()
     fsq_dir, overture_dir, osm_dir = _paths(root, scope.slug, args.source_tile_deg)
 
-    rebuild_match = args.rebuild_match or args.refresh_sources
+    # A refresh no longer forces rebuilds by itself: matching and finalization
+    # compare the source snapshot recorded beside their checkpoints, which also
+    # works when the stages run in separate sessions.
+    rebuild_match = args.rebuild_match
     rebuild_finalize = args.rebuild_finalize or rebuild_match
+    if args.refresh_sources and args.only in ("match", "finalize"):
+        print("NOTE: --refresh-sources only affects the sources stage; it is ignored with "
+              f"--only {args.only}.")
 
     try:
         if args.only in ("all", "sources"):
@@ -212,10 +232,13 @@ def main() -> None:
             )
 
             print("\n=== SOURCE 2/3: Overture ===")
-            overture_release = resolve_overture_release(root, refresh=args.refresh_sources)
+            overture_release = pin_overture_release(
+                root, overture_dir, refresh=args.refresh_sources,
+            )
+            # The boundary file is named after its release, so a new release
+            # gets a new boundary without deleting anything.
             boundary = prepare_overture_boundary(
                 root, temp_dir, args.main_memory, overture_release,
-                refresh=args.refresh_sources,
             )
             source_tiles = filter_tiles_to_boundary(
                 source_tiles_for_scope(scope, args.source_tile_deg),
@@ -225,7 +248,6 @@ def main() -> None:
             overture_dir = prepare_overture(
                 root, scope, source_tiles, overture_release, boundary,
                 args.overture_workers, temp_dir, args.worker_memory,
-                refresh=args.refresh_sources,
                 keep_raw=args.keep_intermediates,
             )
 
@@ -240,9 +262,8 @@ def main() -> None:
                 print("\nSource acquisition complete. You may shut down now and later run --only match.")
                 return
 
-        if not (osm_dir / "_SUCCESS.json").exists() or not fsq_dir.exists() or not overture_dir.exists():
-            raise RuntimeError("Source checkpoints are incomplete. Run --only sources first.")
-
+        # Completeness and snapshot consistency are checked inside
+        # prepare_matches() and finalize(), per source tile.
         edge_root = root / "data" / "work" / scope.slug / "edges"
 
         if args.only in ("all", "match"):
@@ -257,9 +278,6 @@ def main() -> None:
             if args.only == "match":
                 print("\nMatching complete. You may shut down now and later run --only finalize.")
                 return
-
-        if not edge_root.exists():
-            raise RuntimeError("Match checkpoints are missing. Run --only match first.")
 
         if args.only in ("all", "finalize"):
             print("\n=== FINALIZE CANONICAL POINT LAYER ===")
@@ -276,6 +294,9 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted safely. Completed checkpoints remain valid; rerun the same command to continue.")
         raise SystemExit(130)
+    except PipelineStateError as exc:
+        # An expected state problem with an instruction, not a program error.
+        raise SystemExit(f"\nERROR: {exc}")
 
 
 if __name__ == "__main__":
