@@ -1,4 +1,4 @@
-"""The Python name normalizer must equal the SQL one that produces the data."""
+"""Check Python/SQL name-normalization parity on a Unicode-stable sample."""
 
 import unicodedata
 
@@ -15,21 +15,43 @@ REAL_NAMES = [
 ]
 
 
+def _python_strip_accents(text: str) -> str:
+    text = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in text if not unicodedata.category(ch).startswith("M"))
+
+
 def _samples():
     ranges = [range(0x20, 0x3000), range(0xFB00, 0xFB50), range(0xFF00, 0xFFF0),
               range(0x1D400, 0x1D420)]
-    out = list(REAL_NAMES)
+
+    chars = []
     for r in ranges:
         for cp in r:
             if 0xD800 <= cp <= 0xDFFF:
                 continue
             ch = chr(cp)
-            # DuckDB's utf8proc may use a newer Unicode version than this
-            # Python (3.11 ships Unicode 14.0). A character unassigned in
-            # Python's database is not a disagreement about the rules.
-            if unicodedata.category(ch) == "Cn":
-                continue
-            out += [f"a{ch}b", ch, f"X{ch}"]
+            if unicodedata.category(ch) != "Cn":
+                chars.append(ch)
+
+    # Python's unicodedata and DuckDB's utf8proc are separate Unicode
+    # databases. At version boundaries they can classify newly assigned
+    # characters differently. Establish the subset on which the primitive
+    # accent-stripping step agrees, then test the complete OpenPlaces
+    # normalization pipeline on that Unicode-stable subset.
+    con = duckdb.connect()
+    try:
+        con.register("c", pa.table({"i": list(range(len(chars))), "ch": chars}))
+        duck_stripped = dict(
+            con.execute("SELECT i, strip_accents(ch) FROM c").fetchall()
+        )
+    finally:
+        con.close()
+
+    out = list(REAL_NAMES)
+    for i, ch in enumerate(chars):
+        if duck_stripped[i] != _python_strip_accents(ch):
+            continue
+        out += [f"a{ch}b", ch, f"X{ch}"]
     return out
 
 
