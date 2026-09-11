@@ -4,6 +4,7 @@ Each test reproduces a sequence of sessions that 0.2.0 handled incorrectly.
 """
 
 import json
+import shutil
 
 import pyarrow.parquet as pq
 import pytest
@@ -11,7 +12,13 @@ import pytest
 from openplaces_ph import sources
 from openplaces_ph.config import Scope
 from openplaces_ph.finalize import finalize
-from openplaces_ph.matching import COMPLETE_NAME, MANIFEST_NAME, MatchConfig, prepare_matches
+from openplaces_ph.matching import (
+    COMPLETE_NAME,
+    MANIFEST_NAME,
+    MatchConfig,
+    match_checkpoints_complete,
+    prepare_matches,
+)
 from openplaces_ph.snapshot import (
     adopt_unbound_dir,
     bind_dir_to_release,
@@ -79,6 +86,30 @@ def test_finalize_refuses_unfinished_matching(project):
     _snapshot_one(project)
     edge_root = _match(project)
     (edge_root / COMPLETE_NAME).unlink()  # as after an interrupted --only match
+    with pytest.raises(RuntimeError, match="Matching has not finished"):
+        _finalize(project, edge_root)
+
+
+@pytest.mark.parametrize("mutation", ["delete", "corrupt", "extra"])
+def test_finalize_refuses_changed_completed_shard_inventory(project, mutation):
+    _snapshot_one(project)
+    edge_root = _match(project)
+    shard = next((edge_root / "fsq__osm").glob("*.parquet"))
+
+    if mutation == "delete":
+        shard.unlink()
+    elif mutation == "corrupt":
+        shard.write_bytes(b"not parquet")
+    else:
+        shutil.copy2(shard, shard.with_name("unexpected.parquet"))
+
+    # Inventory changes are cheap to detect; structural corruption is checked
+    # by the stronger validation finalization uses.
+    if mutation == "corrupt":
+        assert not match_checkpoints_complete(edge_root, validate_parquet=True)
+    else:
+        assert not match_checkpoints_complete(edge_root)
+
     with pytest.raises(RuntimeError, match="Matching has not finished"):
         _finalize(project, edge_root)
 

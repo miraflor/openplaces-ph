@@ -27,6 +27,7 @@ cannot silently drift from the SQL that actually produces the data.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -537,11 +538,44 @@ def _expected_shards(
     return shards
 
 
-def match_checkpoints_complete(edge_root: Path) -> bool:
-    """True when every shard for the manifest's configuration and snapshot exists."""
+def _inventory_payload(names: list[str]) -> dict[str, object]:
+    """Compact, stable identity of an exact set of shard paths."""
+    digest = hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+    return {"count": len(names), "paths_sha256": digest}
+
+
+def _shard_inventory(edge_root: Path) -> tuple[dict[str, object], list[Path]]:
+    """Return the current Parquet shard inventory under ``edge_root``."""
+    paths = sorted(
+        edge_root.rglob("*.parquet"),
+        key=lambda p: p.relative_to(edge_root).as_posix(),
+    )
+    names = [p.relative_to(edge_root).as_posix() for p in paths]
+    return _inventory_payload(names), paths
+
+
+def match_checkpoints_complete(
+    edge_root: Path,
+    *,
+    validate_parquet: bool = False,
+) -> bool:
+    """True only when the completion marker still describes the shard set.
+
+    ``validate_parquet`` is deliberately optional: ``--status`` needs a cheap
+    integrity check, while finalization pays the one-time cost of opening every
+    shard footer before it trusts those files as input.
+    """
     manifest = read_json(edge_root / MANIFEST_NAME)
     complete = read_json(edge_root / COMPLETE_NAME)
-    return manifest is not None and complete is not None and complete.get("manifest") == manifest
+    if manifest is None or complete is None or complete.get("manifest") != manifest:
+        return False
+    recorded = complete.get("shards")
+    if not isinstance(recorded, dict):
+        return False
+    actual, paths = _shard_inventory(edge_root)
+    if recorded != actual:
+        return False
+    return not validate_parquet or all(valid_parquet(path) for path in paths)
 
 
 def prepare_matches(
@@ -643,13 +677,30 @@ def prepare_matches(
 
     stop_file.unlink(missing_ok=True)
 
-    # Every shard is promoted atomically, so existence means completeness.
-    missing = [p for p in _expected_shards(edge_root, scope, source_tiles, match_tile_deg)
-               if not p.exists()]
-    if missing:
+    # Seal the exact shard inventory. Merely checking _COMPLETE.json later is
+    # insufficient: a shard can be deleted/corrupted after the marker is
+    # written, and an unexpected stale .parquet would be consumed by finalize.
+    expected = sorted(
+        set(_expected_shards(edge_root, scope, source_tiles, match_tile_deg)),
+        key=lambda p: p.relative_to(edge_root).as_posix(),
+    )
+    bad = [p for p in expected if not valid_parquet(p)]
+    if bad:
         raise PipelineStateError(
-            f"Matching finished with {len(missing)} shard(s) missing (first: {missing[0]}). "
+            f"Matching finished with {len(bad)} missing or invalid shard(s) "
+            f"(first: {bad[0]}). "
             "Rerun --only match."
         )
-    atomic_json(edge_root / COMPLETE_NAME, {"manifest": config_payload})
+    expected_names = [p.relative_to(edge_root).as_posix() for p in expected]
+    expected_inventory = _inventory_payload(expected_names)
+    actual_inventory, _ = _shard_inventory(edge_root)
+    if actual_inventory != expected_inventory:
+        raise PipelineStateError(
+            "Matching finished with an unexpected edge-shard inventory. "
+            "Rerun --only match with --rebuild-match."
+        )
+    atomic_json(
+        edge_root / COMPLETE_NAME,
+        {"manifest": config_payload, "shards": expected_inventory},
+    )
     return edge_root
