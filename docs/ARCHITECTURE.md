@@ -87,14 +87,26 @@ Heavy acquisition libraries are imported lazily. Merely asking for `openplaces -
 
 | Stage | Durable unit | Normal loss after interruption |
 |---|---|---|
-| OSM national download | `.part` byte range | only uncommitted bytes |
-| OSM local preparation | local stage | current local stage |
-| Overture | 1-degree tile | current tile |
-| Foursquare | 1-degree tile | current tile |
+| OSM national download | `.part` byte range, guarded by `If-Range` | only uncommitted bytes (all bytes if the upstream file changed) |
+| OSM local preparation | local stage, named after the PBF version | current local stage |
+| Overture | 1-degree tile of the pinned release | current tile |
+| Foursquare | 1-degree tile of the pinned release | current tile |
 | Pairwise matching | 0.25-degree tile × source pair | current shard |
 | Union-find | transactional snapshot | row groups after last snapshot |
 
 Output files are written to temporary `.part` paths and renamed only after successful completion.
+
+### 4.1 One source snapshot per downstream checkpoint
+
+A durable unit is only reusable while its *inputs* are unchanged, and the stages can run in different sessions. Three records make that explicit (`snapshot.py`):
+
+1. every normalized FSQ/Overture directory contains `_release.json`; when the pinned release changes, the whole directory is renamed away and deleted before the first tile of the new release is written, so one directory never holds two releases;
+2. the OSM tile cache's `_SUCCESS.json` records the ETag / Last-Modified / size of the PBF it came from;
+3. the **source snapshot** — both releases plus the OSM record — is stored in the match manifest (`edges/_config.json`) and therefore also in finalization's dependency record.
+
+Before it starts, matching checks that every source tile exists and that each directory belongs to the pinned release; finalization additionally checks that the match shards carry the current snapshot and that `_COMPLETE.json` exists. A mismatch either rebuilds (matching) or stops with an instruction (finalization). An empty edge shard is written only when a source is legitimately empty, never because a file is missing.
+
+Matching reads OSM halos only from the run's source tiles, the same set that finalization reads; a halo into a block removed by the land mask would otherwise create an edge that finalization cannot resolve.
 
 ---
 

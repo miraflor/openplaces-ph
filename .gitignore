@@ -8,3 +8,4 @@ __pycache__/
 *.token
 .vscode/
 .idea/
+*.egg-info/

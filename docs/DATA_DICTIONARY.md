@@ -8,7 +8,7 @@ This document describes the public output fields. Types may be represented sligh
 |---|---|
 | `canonical_id` | Stable-looking identifier chosen from the preferred available source ID (`fsq:...`, otherwise `overture:...`, otherwise `osm:...`). It is stable only as long as the relevant upstream observation remains in the cluster. |
 | `canonical_name` | Preferred display name, using explicit source priority FSQ → Overture → OSM. |
-| `canonical_category` | Preferred source category using the same priority. This is not yet a harmonized Philippine industry classification. |
+| `canonical_category` | Preferred source category using the same priority. If the preferred source has no category, the next source's category is used, so this column can mix the FSQ, Overture, and OSM vocabularies, and it can come from a different source than `canonical_name`. This is not yet a harmonized Philippine industry classification. |
 | `lon` | Median longitude of cluster members. |
 | `lat` | Median latitude of cluster members. |
 | `geometry` | GeoParquet point in `OGC:CRS84` (X=longitude, Y=latitude). |
@@ -27,7 +27,7 @@ This document describes the public output fields. Types may be represented sligh
 | `overture_name` | Original Overture primary name. |
 | `overture_category` | Overture category representation selected by the source normalizer. |
 | `overture_provenance` | Preserved Overture `sources` provenance serialized as text. |
-| `overture_license` | License inferred conservatively from preserved Overture provider provenance. Unknown/mixed cases are marked rather than guessed. |
+| `overture_license` | License inferred conservatively from the provider dataset names in the preserved Overture provenance (re-derived at every finalization). Unknown/mixed cases are marked rather than guessed. |
 | `osm_id` | OSM object identifier such as `node/...`, `way/...`, or `relation/...`, if present. |
 | `osm_name` | Original OSM name. |
 | `osm_category` | Compact category representation assembled from POI-relevant OSM tags. |
@@ -78,3 +78,4 @@ Every row is a threshold-accepted cross-source link.
 | `canonical_pois` | Number of canonical entities. |
 | `canonical_pois_completed_transitively` | Number of canonical entities with `completed_transitively=true`. |
 | `evidence_tiers` | Counts of canonical rows by `single` / `double` / `triple`. |
+| `sources` | The source snapshot behind these outputs: `fsq_release`, `overture_release`, and `osm` (the OSM tile cache record, including the Geofabrik PBF version). |
