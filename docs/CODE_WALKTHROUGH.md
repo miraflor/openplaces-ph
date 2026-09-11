@@ -147,11 +147,27 @@ Opens the Parquet footer. A file merely existing is not enough to count as a che
 
 Downloads a large file into `*.part` and resumes from the existing byte count if the server supports HTTP Range requests.
 
+A small sidecar, `*.part.meta.json`, records which upstream version (ETag or Last-Modified) the partial bytes came from. A resume sends that version in an `If-Range` header: the server continues only if its file is still the same, and otherwise sends the whole new file. Geofabrik replaces its extract every day, so without this a resume on a later day would join the start of one file to the end of another.
+
 Before promotion it checks the expected byte length. This prevents a truncated national OSM file from becoming a permanent “successful” cache entry.
 
 ### `normalize_name()`
 
-This is the human-readable Python version of name normalization used by tests and diagnostics. National processing performs equivalent normalization inside DuckDB rather than calling Python once per row.
+This is the human-readable Python version of name normalization used by tests and diagnostics. National processing performs the same normalization inside DuckDB rather than calling Python once per row, and `test_normalization_parity.py` checks that the two agree character by character.
+
+Note what the normalization removes: any letter that does not reduce to plain ASCII after accents are stripped. A name written only in Chinese, Korean, or Arabic script becomes an empty string, and such a record is not included in the output.
+
+---
+
+## `snapshot.py`: which source vintage does each checkpoint belong to?
+
+Every later checkpoint is only valid for the exact source data it was computed from. This module records that relation:
+
+- `bind_dir_to_release()` makes a normalized FSQ/Overture directory hold tiles of one release only;
+- `source_snapshot()` checks that all three sources are complete for the requested tiles and returns one small dictionary describing them;
+- `discard_dir()` removes a directory by renaming it first, so a crash can never leave a half-deleted directory that still looks valid.
+
+Matching stores the snapshot beside its shards; finalization compares it with the current sources before it starts.
 
 ---
 
@@ -308,7 +324,7 @@ Every:
 
 becomes one independent Parquet file.
 
-If matching stops halfway through the Philippines, those completed files remain valid.
+If matching stops halfway through the Philippines, those completed files remain valid. `_config.json` records the matching settings and the source snapshot; if either changes, the shards are rebuilt. `_COMPLETE.json` is written only after every expected shard exists, and finalization will not start without it.
 
 ---
 
@@ -444,6 +460,12 @@ The tests are worth reading because each file isolates one promise made by the p
 - `test_finalize_pipeline.py` — tiny end-to-end finalization, including transitivity and GeoParquet output.
 - `test_imports.py` — cheap CLI imports do not drag in acquisition clients.
 - `test_tiles.py` — tile arithmetic and halos.
+- `test_match_sql.py` — the real matching SQL finds exactly the pairs an all-pairs search finds, and refuses missing source tiles.
+- `test_snapshot.py` — stop/resume and refresh sequences across sessions never mix source vintages.
+- `test_download.py` — byte-range resume against a local server that changes its file between requests.
+- `test_overture_normalize.py` / `test_osm_prepare.py` — source normalization on local data (the OSM test needs Osmium).
+- `test_provenance.py` — Overture licence labels from provider dataset names.
+- `test_normalization_parity.py` — SQL and Python name normalization agree.
 
 A test failure is preferable to a quiet change in the public data contract.
 

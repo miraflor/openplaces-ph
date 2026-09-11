@@ -6,12 +6,14 @@ Design goals for a resource-constrained laptop
 2. Keep remote work in 1-degree blocks, so a failed request loses one block.
 3. Normalize names *once* here. National matching then compares precomputed
    strings in DuckDB instead of repeatedly calling Python fuzzy functions.
-4. Write every completed block atomically to Parquet and skip it forever unless
-   ``--refresh-sources`` is requested.
+4. Write every completed block atomically to Parquet. A normalized source
+   directory is bound to one pinned release (``_release.json``); a block is
+   downloaded again only when that release changes.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -33,8 +35,17 @@ from functools import lru_cache
 
 from .config import Scope, bbox_sql
 from .db import connect
+from .snapshot import adopt_unbound_dir, bind_dir_to_release, discard_dir, pinned_release
 from .tiles import Tile, tiles_for_bboxes
-from .util import atomic_json, check_commands, resume_download, run_command, valid_parquet
+from .util import (
+    atomic_json,
+    check_commands,
+    download_identity,
+    read_json,
+    resume_download,
+    run_command,
+    valid_parquet,
+)
 
 GEOFABRIK_PBF = "https://download.geofabrik.de/asia/philippines-latest.osm.pbf"
 FSQ_REPO = "foursquare/fsq-os-places"
@@ -82,6 +93,13 @@ OSM_KEYS = (
 # removed upstream by ``filter_tiles_to_boundary``.
 OVERTURE_LAND_TOLERANCE_DEG = 0.002
 
+# The overturemaps bbox filter uses strict inequalities (row xmax > query xmin
+# and row xmin < query xmax). A point lying exactly on a tile edge therefore
+# matched *neither* neighbouring tile and was lost. Downloads are widened by a
+# negligible margin (~0.1 m); the half-open tile predicate applied afterwards
+# still assigns every point to exactly one tile.
+OVERTURE_BBOX_EDGE_EPS_DEG = 1e-6
+
 FSQ_LICENSE = "Apache-2.0"
 OSM_LICENSE = "ODbL-1.0"
 OVERTURE_APACHE_LICENSE = "Apache-2.0"
@@ -89,19 +107,60 @@ OVERTURE_CC0_LICENSE = "CC0-1.0"
 OVERTURE_CDLA_LICENSE = "CDLA-Permissive-2.0"
 
 
-def _overture_license_sql(provenance_column: str = "provenance") -> str:
+# Regular expression for "this Overture record declares Foursquare provenance",
+# applied to lower-cased dataset names only. 0.2.0 wrote it with doubled
+# backslashes, so the SQL contained ``\\bfsq\\b``: RE2 reads that as a literal
+# backslash followed by "b", and the ``fsq`` alternative could never match.
+FSQ_PROVENANCE_PATTERN = r"foursquare|\bfsq\b"
+
+# DuckDB serializes the Overture ``sources`` list of structs as, for example,
+# ``[{'property': '', 'dataset': Foursquare, 'record_id': 4b05...}]``.
+# Group 1 captures one dataset value: either a quoted string or an unquoted run.
+# (SQL literal; '' is an escaped quote and \\ is one literal backslash for RE2.)
+_DATASET_VALUE_REGEX = r"'''dataset'':\s*(''(?:[^''\\]|\\.)*''|[^,}]*)'"
+
+
+def overture_datasets_sql(provenance_column: str = "provenance") -> str:
+    """DuckDB expression: lower-cased Overture dataset names, joined by ``|``.
+
+    Provider patterns used to be matched against the *whole* serialized
+    ``sources`` text, which also contains record ids and timestamps. A
+    Foursquare record id containing ``dac`` (about 0.5% of 24-hex ids) was
+    therefore classified as MIXED/REVIEW, and an unknown future provider could
+    be labelled CDLA because of characters in its record id. If no ``dataset``
+    key can be parsed, the whole text is used, i.e. the old behaviour.
+    """
+    text = f"coalesce(CAST({provenance_column} AS VARCHAR), '')"
+    found = f"regexp_extract_all({text}, {_DATASET_VALUE_REGEX}, 1)"
+    return (
+        f"(CASE WHEN len({found}) > 0 "
+        f"THEN '|' || lower(replace(array_to_string({found}, '|'), '''', '')) || '|' "
+        f"ELSE lower({text}) END)"
+    )
+
+
+def overture_fsq_provenance_sql(provenance_column: str = "provenance") -> str:
+    """DuckDB boolean: the Overture record declares Foursquare provenance."""
+    return (
+        f"regexp_matches({overture_datasets_sql(provenance_column)}, "
+        f"'{FSQ_PROVENANCE_PATTERN}')"
+    )
+
+
+def overture_license_sql(provenance_column: str = "provenance") -> str:
     """Return a DuckDB CASE expression for current Overture Places licenses.
 
     Overture Places is multi-license at the upstream-provider level.  We infer
     the applicable license only from provider provenance that Overture itself
     exposes.  Unknown or mixed future providers are deliberately marked for
-    review rather than silently assigned a permissive license.
+    review rather than silently assigned a permissive license. Patterns are
+    matched against dataset names only (see :func:`overture_datasets_sql`).
     """
-    p = f"lower(coalesce(CAST({provenance_column} AS VARCHAR), ''))"
-    is_fsq = f"regexp_matches({p}, 'foursquare')"
-    is_atp = f"regexp_matches({p}, 'alltheplaces|all_the_places')"
+    d = overture_datasets_sql(provenance_column)
+    is_fsq = f"regexp_matches({d}, '{FSQ_PROVENANCE_PATTERN}')"
+    is_atp = f"regexp_matches({d}, 'alltheplaces|all_the_places')"
     is_cdla = (
-        f"regexp_matches({p}, 'meta|microsoft|pinmeto|krick|renderseo|"
+        f"regexp_matches({d}, 'meta|microsoft|pinmeto|krick|renderseo|"
         "brightquery|dac')"
     )
     return (
@@ -113,6 +172,10 @@ def _overture_license_sql(provenance_column: str = "provenance") -> str:
         f"WHEN {is_cdla} THEN '{OVERTURE_CDLA_LICENSE}' "
         "ELSE 'UNKNOWN' END"
     )
+
+
+# Backwards-compatible private name used by 0.2.0 callers.
+_overture_license_sql = overture_license_sql
 
 
 def check_external_tools() -> None:
@@ -193,6 +256,11 @@ def _osmium_export_config(path: Path) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _identity_tag(identity: dict) -> str:
+    """Short, filesystem-safe fingerprint of one downloaded PBF version."""
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
 def prepare_osm(
     root: Path,
     source_tile_deg: float,
@@ -205,13 +273,19 @@ def prepare_osm(
     """Prepare named OSM POIs as partitioned Parquet.
 
     Durable boundaries are intentionally coarse:
-      A. byte-resumable national PBF download
+      A. byte-resumable national PBF download (If-Range protected)
       B. POI-tag-filtered PBF
       C. GeoJSONSeq geometry export
       D. final partitioned Parquet dataset
 
-    Stage D is a single sequential scan of the local GeoJSONSeq. Re-running it
-    after interruption is cheaper than repeatedly rescanning the national PBF.
+    B and C are named after the identity of the PBF they came from, and D
+    records that identity in ``_SUCCESS.json``. Downstream stages use it to
+    know which OSM snapshot they were built from.
+
+    ``refresh`` writes a marker that stays until new tiles are published, so
+    an interrupted refresh continues on the next run with or without the flag
+    (the same behaviour as a re-pinned FSQ/Overture release). If the upstream
+    extract has not changed, nothing is downloaded or rebuilt.
     """
     cache = root / "data" / "cache" / "osm"
     work = root / "data" / "work" / "osm"
@@ -221,32 +295,47 @@ def prepare_osm(
     tag = str(source_tile_deg).replace(".", "p")
     tiles_dir = cache / f"tiles_{tag}deg"
     success = tiles_dir / "_SUCCESS.json"
+    pending = cache / "_REFRESH_PENDING.json"
 
-    if success.exists() and not refresh:
+    if refresh:
+        atomic_json(pending, {"reason": "--refresh-sources"})
+    refreshing = pending.exists()
+
+    if success.exists() and not refreshing:
         print("[OSM] normalized cache ready")
         return tiles_dir
-    if refresh and tiles_dir.exists():
-        shutil.rmtree(tiles_dir)
 
     pbf = resume_download(
         GEOFABRIK_PBF,
         cache / "philippines-latest.osm.pbf",
-        refresh=refresh,
+        refresh=refreshing,
     )
-    poi_pbf = work / "osm-poi.osm.pbf"
-    seq = work / "osm-poi.geojsonseq"
+    identity = download_identity(pbf)
+    current = read_json(success)
+    if current is not None and current.get("pbf") == identity:
+        pending.unlink(missing_ok=True)
+        print("[OSM] normalized cache already matches the current extract")
+        return tiles_dir
 
-    if refresh:
-        poi_pbf.unlink(missing_ok=True)
-        seq.unlink(missing_ok=True)
+    id_tag = _identity_tag(identity)
+    poi_pbf = work / f"osm-poi-{id_tag}.osm.pbf"
+    seq = work / f"osm-poi-{id_tag}.geojsonseq"
+    # Intermediates of another PBF version (or 0.2.0's unversioned names)
+    # can never be reused for this one; remove them to free disk space.
+    for stale in work.glob("osm-poi*"):
+        if id_tag not in stale.name:
+            stale.unlink(missing_ok=True)
 
     if not poi_pbf.exists():
-        tmp = poi_pbf.with_suffix(".osm.pbf.part")
+        tmp = poi_pbf.with_name(poi_pbf.name + ".part")
         tmp.unlink(missing_ok=True)
         filters = [f"nwr/{key}" for key in OSM_KEYS]
         # We do NOT use --omit-referenced here: polygon geometries need their
         # referenced nodes in order to export valid representative points.
-        run_command(["osmium", "tags-filter", "-t", "-o", tmp, "-O", pbf, *filters])
+        # ``-f pbf`` is required: Osmium detects the output format from the
+        # file name, and a name ending in ".part" made 0.2.0 stop here with
+        # "Could not detect file format".
+        run_command(["osmium", "tags-filter", "-t", "-f", "pbf", "-o", tmp, "-O", pbf, *filters])
         os.replace(tmp, poi_pbf)
     else:
         print(f"[cache] {poi_pbf}")
@@ -254,18 +343,42 @@ def prepare_osm(
     if not seq.exists():
         cfg = work / "osmium-export.json"
         _osmium_export_config(cfg)
-        tmp = seq.with_suffix(".geojsonseq.part")
+        tmp = seq.with_name(seq.name + ".part")
         tmp.unlink(missing_ok=True)
         run_command(["osmium", "export", "-f", "geojsonseq", "-c", cfg, "-o", tmp, "-O", poi_pbf])
         os.replace(tmp, seq)
     else:
         print(f"[cache] {seq}")
 
+    success_payload = {"source_tile_deg": source_tile_deg, "pbf": identity}
     tmp_tiles = tiles_dir.with_name(tiles_dir.name + ".part")
-    if tmp_tiles.exists():
-        shutil.rmtree(tmp_tiles)
-    tmp_tiles.mkdir(parents=True)
+    if (read_json(tmp_tiles / "_SUCCESS.json") or {}) != success_payload:
+        if tmp_tiles.exists():
+            shutil.rmtree(tmp_tiles)
+        tmp_tiles.mkdir(parents=True)
+        _partition_osm(seq, tmp_tiles, source_tile_deg, temp_dir, memory_limit)
+        atomic_json(tmp_tiles / "_SUCCESS.json", success_payload)
 
+    # Publish: the old tile set stays readable until the new one is complete.
+    discard_dir(tiles_dir)
+    os.replace(tmp_tiles, tiles_dir)
+    pending.unlink(missing_ok=True)
+
+    if not keep_intermediates:
+        poi_pbf.unlink(missing_ok=True)
+        seq.unlink(missing_ok=True)
+
+    return tiles_dir
+
+
+def _partition_osm(
+    seq: Path,
+    out_dir: Path,
+    source_tile_deg: float,
+    temp_dir: Path,
+    memory_limit: str,
+) -> None:
+    """Stage D: one sequential scan of the GeoJSONSeq into tile partitions."""
     con = connect(temp_dir / "osm_partition", memory_limit=memory_limit, threads=1, spatial=True)
 
     # DESCRIBE without fetchdf(): keeping pandas out of the pipeline saves RAM.
@@ -322,7 +435,7 @@ def prepare_osm(
                   AND lat >= {PH_BBOX[1]} AND lat < {PH_BBOX[3]}
             )
             SELECT * FROM ready
-        ) TO '{tmp_tiles.as_posix()}' (
+        ) TO '{out_dir.as_posix()}' (
             FORMAT PARQUET,
             COMPRESSION ZSTD,
             PARTITION_BY (tile_x, tile_y),
@@ -331,15 +444,6 @@ def prepare_osm(
         """
     )
     con.close()
-
-    atomic_json(tmp_tiles / "_SUCCESS.json", {"source_tile_deg": source_tile_deg})
-    os.replace(tmp_tiles, tiles_dir)
-
-    if not keep_intermediates:
-        poi_pbf.unlink(missing_ok=True)
-        seq.unlink(missing_ok=True)
-
-    return tiles_dir
 
 
 @lru_cache(maxsize=4096)
@@ -390,6 +494,17 @@ def resolve_overture_release(root: Path, *, refresh: bool = False) -> str:
 
     atomic_json(marker, {"stac": OVERTURE_STAC, "release": release})
     return str(release)
+
+
+def pin_overture_release(root: Path, out_dir: Path, *, refresh: bool = False) -> str:
+    """Resolve the Overture release for this run, re-pinning it on ``refresh``.
+
+    Tiles written by <= 0.2.0 carry no release manifest. They are recorded
+    under the release pinned *before* a refresh can change the pin, so that
+    :func:`prepare_overture` can recognise them as old and discard them.
+    """
+    adopt_unbound_dir(out_dir, pinned_release(root, "overture"), "Overture")
+    return resolve_overture_release(root, refresh=refresh)
 
 
 def _stream_overture_tile(
@@ -550,7 +665,6 @@ def _overture_worker(
     boundary_s: str,
     temp_s: str,
     memory_limit: str,
-    refresh: bool,
     keep_raw: bool,
 ) -> None:
     root = Path(root_s)
@@ -561,20 +675,22 @@ def _overture_worker(
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
 
+    # ``out_dir`` is bound to ``release`` by prepare_overture(), so a valid
+    # file here is always a tile of the pinned release.
     target = out_dir / f"{tile.key}.parquet"
-    if valid_parquet(target) and not refresh:
+    if valid_parquet(target):
         return
     target.unlink(missing_ok=True)
 
     raw = raw_dir / f"{tile.key}.{release}.parquet"
-    if refresh:
-        raw.unlink(missing_ok=True)
 
     # One 1-degree bbox == one durable network unit. Overture's public reader
     # uses STAC to select only intersecting source Parquet fragments and streams
     # batches from S3. The explicit release keeps all resumed tiles consistent.
     if not valid_parquet(raw):
-        found = _stream_overture_tile("place", tile.bbox, release, raw)
+        eps = OVERTURE_BBOX_EDGE_EPS_DEG
+        download_bbox = (tile.west - eps, tile.south - eps, tile.east + eps, tile.north + eps)
+        found = _stream_overture_tile("place", download_bbox, release, raw)
         if not found:
             _write_empty_source_tile(target, "overture")
             return
@@ -591,7 +707,7 @@ def _overture_worker(
         categories.append("categories.primary")
     category_expr = "COALESCE(" + ", ".join(categories + ["NULL::VARCHAR"]) + ")" if categories else "NULL::VARCHAR"
     provenance_expr = "CAST(sources AS VARCHAR)" if "sources" in columns else "NULL::VARCHAR"
-    overture_license_expr = _overture_license_sql("provenance")
+    overture_license_expr = overture_license_sql("provenance")
     status_pred = (
         "AND (operating_status IS NULL OR operating_status <> 'permanently_closed')"
         if "operating_status" in columns else ""
@@ -677,19 +793,25 @@ def prepare_overture(
     temp_dir: Path,
     memory_limit: str,
     *,
-    refresh: bool = False,
     keep_raw: bool = False,
 ) -> Path:
+    """Normalize every missing Overture block of ``release``.
+
+    The output directory is bound to ``release`` before any block is written:
+    if it holds tiles of another release, they are discarded first. Tiles of
+    two releases can therefore never be mixed, even after an interrupted
+    refresh, and an interrupted refresh continues instead of restarting.
+    """
     out_dir = root / "data" / "sources" / scope.slug / "overture"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    todo = [t for t in source_tiles if refresh or not valid_parquet(out_dir / f"{t.key}.parquet")]
+    bind_dir_to_release(out_dir, release, "Overture")
+    todo = [t for t in source_tiles if not valid_parquet(out_dir / f"{t.key}.parquet")]
     print(f"[Overture] pinned release {release}")
     print(f"[Overture] {len(source_tiles) - len(todo)}/{len(source_tiles)} blocks cached")
 
     _run_tiles(
         _overture_worker, todo, workers,
         str(root), scope.bboxes, scope.slug, release, str(boundary), str(temp_dir),
-        memory_limit, refresh, keep_raw,
+        memory_limit, keep_raw,
     )
     return out_dir
 
@@ -768,7 +890,6 @@ def _fsq_worker(
     release: str,
     temp_s: str,
     memory_limit: str,
-    refresh: bool,
     retries: int = 4,
 ) -> None:
     """Query one FSQ 1-degree block and commit it atomically.
@@ -783,7 +904,8 @@ def _fsq_worker(
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / f"{tile.key}.parquet"
 
-    if valid_parquet(target) and not refresh:
+    # ``out_dir`` is bound to ``release`` by prepare_foursquare().
+    if valid_parquet(target):
         return
     target.unlink(missing_ok=True)
 
@@ -902,17 +1024,25 @@ def prepare_foursquare(
     *,
     refresh: bool = False,
 ) -> Path:
+    """Normalize every missing Foursquare block of the pinned release.
+
+    ``refresh`` re-pins the newest release. Existing blocks are kept when the
+    newest release is the one already pinned; otherwise the directory is
+    discarded before the first new block is written (see prepare_overture).
+    """
+    out_dir = root / "data" / "sources" / scope.slug / "fsq"
+    # Record <= 0.2.0 tiles under the release pinned before this run.
+    adopt_unbound_dir(out_dir, pinned_release(root, "fsq"), "Foursquare")
     release = resolve_fsq_release(root, refresh=refresh)
     print(f"[Foursquare] pinned release {release}")
 
-    out_dir = root / "data" / "sources" / scope.slug / "fsq"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    todo = [t for t in source_tiles if refresh or not valid_parquet(out_dir / f"{t.key}.parquet")]
+    bind_dir_to_release(out_dir, release, "Foursquare")
+    todo = [t for t in source_tiles if not valid_parquet(out_dir / f"{t.key}.parquet")]
     print(f"[Foursquare] {len(source_tiles) - len(todo)}/{len(source_tiles)} blocks cached")
 
     _run_tiles(
         _fsq_worker, todo, workers,
-        str(root), scope.bboxes, scope.slug, release, str(temp_dir), memory_limit, refresh,
+        str(root), scope.bboxes, scope.slug, release, str(temp_dir), memory_limit,
     )
     return out_dir
 
@@ -932,6 +1062,13 @@ def regular_source_tile_files(source_dir: Path, tile: Tile) -> list[Path]:
     acquisition stage has finished, which is the only time this is called.
     """
     return list(_regular_source_tile_files_cached(source_dir, tile.key))
+
+
+def clear_tile_file_caches() -> None:
+    """Forget cached tile listings. Each stage calls this once at its start,
+    so a stage never uses a listing made before acquisition changed a file."""
+    _osm_tile_files_cached.cache_clear()
+    _regular_source_tile_files_cached.cache_clear()
 
 
 # ---------------------------------------------------------------------------
