@@ -12,7 +12,10 @@ This edition does the whole candidate generation + string scoring in DuckDB:
 * DuckDB's native Jaro-Winkler similarity scores both original token order and
   alphabetically sorted tokens, which handles e.g. "SM North Starbucks" versus
   "Starbucks SM North" without Python/RapidFuzz overhead;
-* every 0.25-degree tile x source-pair is an atomic Parquet checkpoint.
+* every 0.25-degree tile x source-pair is an atomic Parquet checkpoint;
+* the checkpoint manifest records the source snapshot, so shards built from
+  another source vintage are never reused, and ``_COMPLETE.json`` tells
+  finalization that every shard of the current snapshot exists.
 
 Single source of truth for thresholds
 -------------------------------------
@@ -26,7 +29,6 @@ from __future__ import annotations
 
 import math
 import os
-import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,12 +38,21 @@ import pyarrow.parquet as pq
 
 from .config import Scope, bbox_sql
 from .db import connect
-from .sources import osm_tile_files, regular_source_tile_files
+from .snapshot import PipelineStateError, discard_dir, source_snapshot
+from .sources import (
+    clear_tile_file_caches,
+    osm_tile_files,
+    overture_fsq_provenance_sql,
+    regular_source_tile_files,
+)
 from .tiles import Tile, bbox_with_halo, child_tiles, intersects, tiles_for_bboxes
-from .util import atomic_json, quote_paths, valid_parquet
+from .util import atomic_json, quote_paths, read_json, valid_parquet
 
 EARTH_RADIUS_M = 6_371_008.8
 PAIRS = (("fsq", "overture"), ("fsq", "osm"), ("overture", "osm"))
+
+MANIFEST_NAME = "_config.json"
+COMPLETE_NAME = "_COMPLETE.json"
 
 # Geodesy constants used to convert a metre budget into a *safe upper bound* in
 # degrees anywhere in the Philippines.
@@ -284,9 +295,7 @@ def _candidate_sql(
 
     if {a, b} == {"fsq", "overture"}:
         ov_provenance = "right_provenance" if b == "overture" else "left_provenance"
-        independent_expr = (
-            f"NOT regexp_matches(lower(coalesce({ov_provenance},'')), 'foursquare|\\\\bfsq\\\\b')"
-        )
+        independent_expr = f"NOT {overture_fsq_provenance_sql(ov_provenance)}"
     else:
         independent_expr = "true"
 
@@ -408,10 +417,20 @@ def _files_for_bbox(
     fsq_dir: Path,
     overture_dir: Path,
     osm_dir: Path,
+    allowed: frozenset[tuple[int, int]] | None = None,
 ) -> list[Path]:
-    """Return only the 1-degree source files touching a small bbox/halo."""
+    """Return only the 1-degree source files touching a small bbox/halo.
+
+    ``allowed`` holds the (ix, iy) indices of the run's source tiles. OSM is
+    partitioned for the whole country, so without this filter a halo could
+    read OSM observations from a block that the land mask removed. Finalization
+    never reads such a block, so one accepted edge into it made the national
+    edge-resolution check fail at the very end of a run.
+    """
     files: list[Path] = []
     for tile in tiles_for_bboxes([bbox], source_tile_deg):
+        if allowed is not None and (tile.ix, tile.iy) not in allowed:
+            continue
         if source == "fsq":
             files.extend(regular_source_tile_files(fsq_dir, tile))
         elif source == "overture":
@@ -436,6 +455,7 @@ def _match_block_worker(
     memory_limit: str,
     cfg: MatchConfig,
     stop_s: str,
+    allowed: frozenset[tuple[int, int]] | None = None,
 ) -> None:
     """Process one 1-degree parent block and checkpoint every child/pair."""
     root = Path(root_s)
@@ -463,14 +483,23 @@ def _match_block_worker(
                 target.unlink(missing_ok=True)
 
                 a_files = _files_for_bbox(
-                    a, core.bbox, source_tile_deg, fsq_dir, overture_dir, osm_dir
+                    a, core.bbox, source_tile_deg, fsq_dir, overture_dir, osm_dir, allowed
                 )
+                if not a_files:
+                    # FSQ/Overture record even an empty block as a real file,
+                    # so a missing file means "not downloaded". An empty shard
+                    # written now would be skipped by every later run.
+                    raise PipelineStateError(
+                        f"{a} source tile for block {block.key} is missing; "
+                        "refusing to write an empty match shard. Run --only sources first."
+                    )
                 b_files = _files_for_bbox(
                     b, bbox_with_halo(core.bbox, cfg.max_distance_m),
-                    source_tile_deg, fsq_dir, overture_dir, osm_dir,
+                    source_tile_deg, fsq_dir, overture_dir, osm_dir, allowed,
                 )
-
-                if not a_files or not b_files:
+                if not b_files:
+                    # Legitimately empty, e.g. no OSM partition exists because
+                    # the block has no named OSM POIs.
                     _write_empty_edge(target)
                     continue
 
@@ -494,6 +523,27 @@ def _match_block_worker(
         con.close()
 
 
+def _expected_shards(
+    edge_root: Path,
+    scope: Scope,
+    source_tiles: list[Tile],
+    match_tile_deg: float,
+) -> list[Path]:
+    shards: list[Path] = []
+    for block in source_tiles:
+        for core in child_tiles(block, match_tile_deg):
+            if any(intersects(core.bbox, b) for b in scope.bboxes):
+                shards.extend(edge_root / f"{a}__{b}" / f"{core.key}.parquet" for a, b in PAIRS)
+    return shards
+
+
+def match_checkpoints_complete(edge_root: Path) -> bool:
+    """True when every shard for the manifest's configuration and snapshot exists."""
+    manifest = read_json(edge_root / MANIFEST_NAME)
+    complete = read_json(edge_root / COMPLETE_NAME)
+    return manifest is not None and complete is not None and complete.get("manifest") == manifest
+
+
 def prepare_matches(
     root: Path,
     scope: Scope,
@@ -510,27 +560,48 @@ def prepare_matches(
     *,
     rebuild: bool = False,
 ) -> Path:
-    """Create all pairwise edge shards; safe to interrupt and rerun."""
-    edge_root = root / "data" / "work" / scope.slug / "edges"
-    manifest = edge_root / "_config.json"
-    config_payload = dict(cfg.describe(), source_tile_deg=source_tile_deg,
-                          match_tile_deg=match_tile_deg)
+    """Create all pairwise edge shards; safe to interrupt and rerun.
 
-    if manifest.exists() and not rebuild:
-        import json
-        try:
-            previous = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            previous = None
-        if previous != config_payload:
-            print("[match] matching configuration changed; rebuilding edge checkpoints")
+    Refuses to start unless every source layer is complete and belongs to one
+    snapshot. The manifest stores that snapshot, so shards are rebuilt
+    automatically after any source refresh, however the stages are split
+    across sessions.
+    """
+    clear_tile_file_caches()
+    snapshot = source_snapshot(root, source_tiles, fsq_dir, overture_dir, osm_dir)
+
+    edge_root = root / "data" / "work" / scope.slug / "edges"
+    manifest = edge_root / MANIFEST_NAME
+    config_payload = dict(
+        cfg.describe(),
+        source_tile_deg=source_tile_deg,
+        match_tile_deg=match_tile_deg,
+        sources=snapshot,
+    )
+
+    if not rebuild:
+        previous = read_json(manifest)
+        if previous is None:
+            if edge_root.exists() and any(edge_root.rglob("*.parquet")):
+                print("[match] edge checkpoints have no readable manifest; rebuilding them")
+                rebuild = True
+        elif previous != config_payload:
+            if "sources" not in previous:
+                print(
+                    "[match] edge checkpoints were written by <= 0.2.0 without a record of "
+                    "their source snapshot; rebuilding them once"
+                )
+            else:
+                print("[match] matching configuration or source snapshot changed; rebuilding edge checkpoints")
             rebuild = True
 
-    if rebuild and edge_root.exists():
-        shutil.rmtree(edge_root)
+    if rebuild:
+        discard_dir(edge_root)
     edge_root.mkdir(parents=True, exist_ok=True)
+    (edge_root / COMPLETE_NAME).unlink(missing_ok=True)
     atomic_json(manifest, config_payload)
 
+    allowed = frozenset((t.ix, t.iy) for t in source_tiles)
     workers = max(1, min(workers, len(source_tiles) or 1))
     stop_file = edge_root / ".stop"
     stop_file.unlink(missing_ok=True)
@@ -543,7 +614,7 @@ def prepare_matches(
                 _match_block_worker(
                     block, str(root), scope, source_tile_deg, match_tile_deg,
                     str(fsq_dir), str(overture_dir), str(osm_dir), str(temp_dir),
-                    memory_limit, cfg, str(stop_file),
+                    memory_limit, cfg, str(stop_file), allowed,
                 )
         except KeyboardInterrupt:
             stop_file.touch()
@@ -555,18 +626,30 @@ def prepare_matches(
                     _match_block_worker, block, str(root), scope,
                     source_tile_deg, match_tile_deg,
                     str(fsq_dir), str(overture_dir), str(osm_dir), str(temp_dir),
-                    memory_limit, cfg, str(stop_file),
+                    memory_limit, cfg, str(stop_file), allowed,
                 )
                 for block in source_tiles
             ]
             try:
                 for future in as_completed(futures):
                     future.result()
-            except KeyboardInterrupt:
+            except BaseException:
+                # Ctrl+C *or* a failed block: ask the other workers to stop at
+                # their next shard instead of finishing whole blocks first.
                 stop_file.touch()
                 for future in futures:
                     future.cancel()
                 raise
 
     stop_file.unlink(missing_ok=True)
+
+    # Every shard is promoted atomically, so existence means completeness.
+    missing = [p for p in _expected_shards(edge_root, scope, source_tiles, match_tile_deg)
+               if not p.exists()]
+    if missing:
+        raise PipelineStateError(
+            f"Matching finished with {len(missing)} shard(s) missing (first: {missing[0]}). "
+            "Rerun --only match."
+        )
+    atomic_json(edge_root / COMPLETE_NAME, {"manifest": config_payload})
     return edge_root
