@@ -882,7 +882,7 @@ def finalize(
             f"Match checkpoints {reason}. Run `openplaces --only match` (it rebuilds them) "
             "before finalizing."
         )
-    if not match_checkpoints_complete(edge_root):
+    if not match_checkpoints_complete(edge_root, validate_parquet=True):
         raise PipelineStateError(
             "Matching has not finished for the current configuration and sources. "
             "Run `openplaces --only match` to complete it before finalizing."
