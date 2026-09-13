@@ -180,11 +180,6 @@ The core already supports a valid empty GeoParquet output for an area with no
 POIs. `openplaces validate` now treats that as a valid zero-row dataset rather
 than misreading the absent `min(source_count)` as a source-count failure.
 
-## What this refactor deliberately does not change
-
-It does not recalibrate entity matching, replace Jaro-Winkler, change the 120 m
-default, alter constrained union-find, or add an LLM.
-
 ## Known gaps left open
 
 - `--sources osm` alone produces no land mask, so tile coverage extends over
