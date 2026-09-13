@@ -18,7 +18,6 @@ dependencies:
   - pyarrow
   - pyyaml
   - requests
-  - huggingface_hub
   - pytest
   - pip
 

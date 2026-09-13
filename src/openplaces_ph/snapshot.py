@@ -38,6 +38,7 @@ from typing import Iterable
 
 from .tiles import Tile
 from .util import atomic_json, read_json, valid_parquet
+from .source_set import ALL_SOURCES, normalize_sources
 
 RELEASE_MANIFEST = "_release.json"
 
@@ -138,22 +139,27 @@ def source_snapshot(
     fsq_dir: Path,
     overture_dir: Path,
     osm_dir: Path,
+    sources: tuple[str, ...] = ALL_SOURCES,
 ) -> dict:
-    """Return the identity of complete, consistent source layers, or raise.
-
-    A missing source tile must stop the pipeline here. Before this check,
-    matching wrote an empty edge shard for a tile that had not been downloaded
-    yet, and later runs skipped that "completed" shard forever.
-    """
+    """Return the identity of complete, consistent selected source layers."""
+    selected = normalize_sources(sources, default=ALL_SOURCES)
+    active = set(selected)
     tiles = list(source_tiles)
     problems: list[str] = []
+    # The active source set is part of the durable identity for every 0.3 run.
+    # Old 0.2 summaries remain readable through infer_output_sources().
+    snapshot: dict = {"active_sources": list(selected)}
 
-    osm_success = read_json(osm_dir / "_SUCCESS.json")
-    if osm_success is None:
-        problems.append("OpenStreetMap tiles are not prepared")
+    if "osm" in active:
+        osm_success = read_json(osm_dir / "_SUCCESS.json")
+        if osm_success is None:
+            problems.append("OpenStreetMap tiles are not prepared")
+        snapshot["osm"] = osm_success
 
-    snapshot: dict = {"osm": osm_success}
     for source, directory in (("fsq", fsq_dir), ("overture", overture_dir)):
+        if source not in active:
+            continue
+
         pinned = pinned_release(root, source)
         adopt_unbound_dir(directory, pinned, source)
         bound = dir_release(directory)
@@ -162,21 +168,26 @@ def source_snapshot(
         elif bound != pinned:
             problems.append(
                 f"{source}: normalized tiles belong to release {bound} but release {pinned} "
-                "is pinned; a refresh (possibly run for another --scope/--areas) has not "
-                "finished for this scope"
+                "is pinned; source acquisition has not finished for this scope"
             )
-        missing = [t.key for t in tiles if not valid_parquet(directory / f"{t.key}.parquet")]
+
+        missing = [
+            tile.key
+            for tile in tiles
+            if not valid_parquet(directory / f"{tile.key}.parquet")
+        ]
         if missing:
             problems.append(
                 f"{source}: {len(missing)} of {len(tiles)} source tiles are missing "
                 f"(first: {missing[0]})"
             )
+
         snapshot[f"{source}_release"] = bound
 
     if problems:
         raise PipelineStateError(
             "Source checkpoints are incomplete or inconsistent:\n  - "
             + "\n  - ".join(problems)
-            + "\nRun `openplaces --only sources` with the same --scope/--areas to finish acquisition."
+            + "\nRun the source stage with the same target and source set."
         )
     return snapshot

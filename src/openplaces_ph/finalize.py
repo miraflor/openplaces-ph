@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 from .config import Scope, bbox_sql
 from .db import connect
 from .matching import EARTH_RADIUS_M, MANIFEST_NAME, match_checkpoints_complete
+from .source_set import ALL_SOURCES, normalize_sources
 from .snapshot import PipelineStateError, source_snapshot
 from .sources import (
     CRS84,
@@ -192,9 +193,10 @@ def build_observations(
     out_path: Path,
     temp_dir: Path,
     memory_limit: str,
+    sources: tuple[str, ...] = ALL_SOURCES,
     rebuild: bool = False,
 ) -> Path:
-    """Concatenate the three normalized sources into one compact table.
+    """Concatenate the selected normalized sources into one compact table.
 
     Two important choices:
 
@@ -212,8 +214,9 @@ def build_observations(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.unlink(missing_ok=True)
 
+    sources = normalize_sources(sources, default=ALL_SOURCES)
     parts = []
-    for source in ("fsq", "overture", "osm"):
+    for source in sources:
         files = _source_files(source, source_tiles, fsq_dir, overture_dir, osm_dir)
         if not files:
             continue
@@ -858,6 +861,7 @@ def finalize(
     edge_root: Path,
     temp_dir: Path,
     memory_limit: str,
+    sources: tuple[str, ...] = ALL_SOURCES,
     rebuild: bool = False,
 ) -> dict:
     out = root / "data" / "output" / scope.slug
@@ -868,10 +872,29 @@ def finalize(
     # below used to be missing, so an interrupted or stale upstream stage
     # produced a plausible-looking but partial canonical layer.
     clear_tile_file_caches()
-    snapshot = source_snapshot(root, source_tiles, fsq_dir, overture_dir, osm_dir)
+    sources = normalize_sources(sources, default=ALL_SOURCES)
+    snapshot = source_snapshot(
+        root, source_tiles, fsq_dir, overture_dir, osm_dir, sources
+    )
     edge_cfg = read_json(edge_root / MANIFEST_NAME)
     if edge_cfg is None:
-        raise PipelineStateError("Match checkpoints are missing. Run `openplaces --only match` first.")
+        raise PipelineStateError(
+            "Match checkpoints are missing. Run the match stage first."
+        )
+    expected_tiles = [tile.key for tile in source_tiles]
+    recorded_sources = edge_cfg.get("active_sources")
+    recorded_tiles = edge_cfg.get("source_tiles")
+    if recorded_sources != list(sources):
+        raise PipelineStateError(
+            "Match checkpoints were built for a different or legacy source set. "
+            "Run the match stage again for the same target and sources before finalizing."
+        )
+    if recorded_tiles != expected_tiles:
+        raise PipelineStateError(
+            "Match checkpoints were built for a different or legacy source-tile inventory. "
+            "The land mask or acquisition extent may have changed; run the match stage again "
+            "before finalizing."
+        )
     if edge_cfg.get("sources") != snapshot:
         reason = (
             "were written by <= 0.2.0, before source snapshots were recorded"
@@ -879,13 +902,13 @@ def finalize(
             else "were built from a different source snapshot than the current sources"
         )
         raise PipelineStateError(
-            f"Match checkpoints {reason}. Run `openplaces --only match` (it rebuilds them) "
+            f"Match checkpoints {reason}. Run the match stage again "
             "before finalizing."
         )
     if not match_checkpoints_complete(edge_root, validate_parquet=True):
         raise PipelineStateError(
             "Matching has not finished for the current configuration and sources. "
-            "Run `openplaces --only match` to complete it before finalizing."
+            "Run the match stage to complete it before finalizing."
         )
 
     out.mkdir(parents=True, exist_ok=True)
@@ -925,7 +948,8 @@ def finalize(
 
     observations = build_observations(
         scope, source_tiles, fsq_dir, overture_dir, osm_dir,
-        out / "observations.parquet", temp_dir, memory_limit, rebuild=rebuild,
+        out / "observations.parquet", temp_dir, memory_limit,
+        sources=sources, rebuild=rebuild,
     )
     edge_ids = build_edge_ids(
         observations, edge_root, work / "edge_ids.parquet", temp_dir, memory_limit, rebuild=rebuild,
