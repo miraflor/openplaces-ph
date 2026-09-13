@@ -2,509 +2,238 @@
 
 **An open, provenance-aware registry of places and establishments in the Philippines.**
 
-OpenPlaces PH combines three open geospatial sources into a single auditable point layer:
+OpenPlaces PH reconciles open geospatial place observations into an auditable
+GeoParquet point layer with explicit `lon`/`lat` coordinate columns. The pipeline
+is designed for reproducible research, bounded memory use, resumability, and inspectable entity
+resolution.
 
-* **Foursquare OS Places**
-* **Overture Maps Places**
-* **OpenStreetMap**, from the Geofabrik Philippines extract
+## Quick start
 
-Rather than treating any one source as authoritative, the pipeline links observations that appear to describe the same real-world place, preserves the original source records, and records the evidence behind each resulting canonical entity.
+```bash
+conda env create -f environment.yml
+conda activate openplaces-ph
+python -m pip install -e .
+openplaces doctor
+```
 
-The project is designed for reproducible research and public-data work, with an emphasis on **provenance, resumability, bounded memory use, and inspectable entity resolution**.
+List configured acquisition areas:
 
-> OpenPlaces PH is not an official Philippine government registry. It is a derived open-data product whose coverage and accuracy depend on its upstream sources and on the matching rules documented in this repository.
+```bash
+openplaces areas
+openplaces areas --search <text>
+```
 
----
+Build any configured area:
 
-## What it produces
+```bash
+openplaces build <area>
+openplaces build <area1> <area2>
+```
 
-The main output is a GeoParquet point layer:
+For a place not listed in `config/areas.yml`:
+
+```bash
+openplaces build --bbox <west> <south> <east> <north> --name <name>
+```
+
+A Philippines-wide run must be explicit:
+
+```bash
+openplaces build --philippines
+```
+
+A bare `openplaces` only prints help.
+
+## Sources
+
+The default source set is Overture Maps Places and OpenStreetMap. That path
+requires no Hugging Face account.
+
+Foursquare OS Places is an optional third source:
+
+```bash
+python -m pip install -e ".[foursquare]"
+hf auth login
+openplaces doctor --with-foursquare
+openplaces build <area> --with-foursquare
+```
+
+The Hugging Face account must have access to `foursquare/fsq-os-places`.
+
+Advanced source selection:
+
+```bash
+openplaces build <area> --sources overture
+openplaces build <area> --sources osm
+openplaces build <area> --sources foursquare overture osm
+```
+
+The selected source set **and effective source-tile inventory** are part of the
+durable checkpoint identity, so matching state from another source combination
+or land-mask result is never silently reused.
+
+A **single-source build** is allowed, but there is then no cross-source entity
+resolution. With one selected source, there are zero match pairs, so every
+source observation remains its own canonical singleton with `source_count = 1`.
+Use a single source when you want a normalized source layer or a lightweight
+pilot, not when you want triangulated deduplication.
+
+**OSM first-run note:** OSM preparation uses the national Philippines Geofabrik
+extract even for a local target, then builds a reusable national tile cache.
+The CLI warns before the first uncached OSM run. For the lightest first run, use
+`--sources overture`.
+
+Note that the land mask used to clip tiles to Philippine land area is derived
+from Overture. A run without Overture has no mask unless a cached boundary from
+an earlier run exists, so tile coverage will differ. Each completed run records
+which boundary release, if any, was applied.
+
+## Output
 
 ```text
 data/output/<scope>/canonical_pois.parquet
 ```
 
-Each row represents one inferred place or establishment.
-
-Typical fields include:
-
-```text
-canonical_id
-canonical_name
-canonical_category
-lon
-lat
-geometry
-
-source_count
-known_independent_source_count
-evidence_tier
-match_score_min
-cluster_max_pair_distance_m
-completed_transitively
-
-fsq_id
-overture_id
-osm_id
-```
-
-Source-specific names, categories, provenance, and licensing fields are retained as well.
-
-Two audit tables accompany the canonical layer:
+Audit and provenance outputs:
 
 ```text
 observations.parquet
 match_edges.parquet
-```
-
-`observations.parquet` contains the normalized records before entity resolution.
-
-`match_edges.parquet` contains the accepted cross-source candidate links and their matching evidence.
-
-A machine-readable run summary is also written:
-
-```text
 summary.json
+run.json            package version, Git SHA/dirty state, config, land-mask state, licensing
+ATTRIBUTION.txt     human-readable source attribution
 ```
 
-See [`docs/DATA_DICTIONARY.md`](docs/DATA_DICTIONARY.md) for field definitions.
+See `docs/DATA_DICTIONARY.md`.
 
----
+## Status and recovery
 
-## Why this exists
-
-Open geographic datasets overlap, but they do not describe places in exactly the same way.
-
-A restaurant might appear:
-
-* under slightly different names;
-* a few metres apart;
-* with different categories;
-* in two or three source datasets;
-* or indirectly in one dataset through another provider.
-
-Simply concatenating the sources therefore produces duplicates. Blind deduplication, on the other hand, can collapse genuinely distinct establishments.
-
-OpenPlaces PH treats this as an **entity-resolution problem**.
-
-The pipeline keeps the observations separate, generates plausible cross-source links, scores those links using location and names, and then constructs canonical entities subject to explicit constraints.
-
-The result is not intended to hide uncertainty. It is intended to make the reconciliation process inspectable.
-
----
-
-## Pipeline
-
-At a high level:
-
-```text
-Foursquare ─────┐
-                │
-Overture ───────┼──> normalize ──> candidate links ──> score ──> cluster ──> canonical POIs
-                │
-OpenStreetMap ──┘                         │                │
-                                         │                │
-                                  match_edges.parquet     │
-                                                          │
-                                                observations.parquet
+```bash
+openplaces status <area>
 ```
 
-The pipeline has three durable stages:
+Ordinary users can stay with `openplaces build <area>`. The three durable stages
+remain available when needed:
 
-```text
-sources  ->  match  ->  finalize
+```bash
+openplaces build <area> --stage sources
+openplaces build <area> --stage match
+openplaces build <area> --stage finalize
 ```
 
-Each stage can be run separately and resumed later.
+Re-running a compatible command is safe; completed checkpoints are reused.
 
----
+## Validate output
 
-## Installation
-
-### 1. Clone the repository
-
-```powershell
-git clone https://github.com/miraflor/openplaces-ph.git
-cd openplaces-ph
+```bash
+openplaces validate <area>
+openplaces validate <area> --strict --json
 ```
 
-### 2. Install the environment
+Checks that must pass: duplicate and null canonical IDs, missing names, missing
+or out-of-range coordinates, scope leakage, and `source_count` consistency with
+source membership and with the selected source set.
 
-The reference environment is defined in `environment.yml`. It is the full runtime and test environment, including the external Osmium command-line tool used for OpenStreetMap source acquisition.
+Checks that only warn, unless `--strict`: coordinates at exactly (0, 0), null
+evidence tier, identical name at an identical rounded location, a missing or
+malformed `run.json` (for legacy outputs), or an output built from a dirty Git
+working tree. A disagreement between `run.json` and the recorded source set is
+a hard failure.
 
-```powershell
-conda env create -f environment.yml
-conda activate openplaces-ph
+## Disk usage and cleanup
+
+```bash
+openplaces storage
+openplaces clean <area>            # preview
+openplaces clean <area> --yes
+openplaces clean <area> --all --yes
+openplaces clean --raw-downloads --yes
+openplaces clean --hf-cache --yes
+openplaces clean --shared-osm-cache --yes
 ```
 
-If you use your own environment, install the Python dependencies plus `osmium-tool`. A plain `python -m pip install -e .` installs the Python package and Python dependencies, but cannot install the external `osmium` executable.
+All cleanup commands are preview-only unless `--yes` is supplied. Cleanup only
+ever touches `data/` under the working root and the Foursquare cache directory;
+anything else is refused. Removing the reusable national OSM tile cache needs
+its own flag because it is expensive to rebuild.
 
-### 3. Install OpenPlaces PH
+## Environment
 
-For the current release, use an editable install from the repository:
+| Variable | Effect |
+|---|---|
+| `OPENPLACES_ROOT` | Working root for `data/` and `config/`. Defaults to the checkout. |
+| `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME` | Used to locate the Foursquare cache for `storage` and `clean --hf-cache`. |
 
-```powershell
-python -m pip install -e .
+## Backwards compatibility
+
+The 0.2 flag interface remains available and is preserved in `legacy_cli.py`:
+
+```bash
+openplaces --areas <area> --only sources
+openplaces legacy --areas <area> --status
 ```
 
-This creates the `openplaces` command.
+Delegation to that interface prints a notice on stderr. `openplaces legacy` with
+no arguments is refused, because in 0.2 a bare call started a national build.
 
-### 4. Authenticate with Hugging Face
+The legacy interface retains the 0.2 **all-three-source** behavior. Therefore a
+legacy acquisition still requires the optional Foursquare install and approved
+Hugging Face access (`python -m pip install -e ".[foursquare]"`). The new
+`openplaces build ...` interface is the recommended zero-auth default.
 
-Foursquare OS Places is accessed through Hugging Face.
+## Matching model
 
-After accepting access to the dataset:
+The tested matching model is unchanged in this refactor.
 
-```powershell
-hf auth login
-```
-
-Do not place access tokens in the repository.
-
-### 5. Verify the installation
-
-```powershell
-osmium --version
-openplaces --help
-python -m pytest -q
-```
-
----
-
-## Start with a small area
-
-Before attempting a national build, it is sensible to exercise the complete pipeline on a smaller scope.
-
-For example:
-
-```powershell
-openplaces --areas metro_manila --only sources --temp-dir D:\openplaces-temp
-openplaces --areas metro_manila --only match --temp-dir D:\openplaces-temp
-openplaces --areas metro_manila --only finalize --temp-dir D:\openplaces-temp
-```
-
-Outputs will be written under the corresponding area directory in `data/output/`.
-
-You can inspect the resulting GeoParquet directly in QGIS, DuckDB, Python, or another GeoParquet-aware tool.
-
----
-
-## Philippines-wide run
-
-A national run can be executed stage by stage:
-
-### Acquire and normalize source data
-
-```powershell
-openplaces --scope philippines --only sources --temp-dir D:\openplaces-temp
-```
-
-### Generate cross-source matches
-
-```powershell
-openplaces --scope philippines --only match --temp-dir D:\openplaces-temp
-```
-
-### Build the canonical registry
-
-```powershell
-openplaces --scope philippines --only finalize --temp-dir D:\openplaces-temp
-```
-
-Or run the complete pipeline:
-
-```powershell
-openplaces --scope philippines --temp-dir D:\openplaces-temp
-```
-
-Check current state without starting new work:
-
-```powershell
-openplaces --scope philippines --status --temp-dir D:\openplaces-temp
-```
-
----
-
-## Resumability
-
-OpenPlaces PH is built around durable checkpoints.
-
-A long run may be interrupted and continued later. Completed units are reused rather than recomputed.
-
-Examples include:
-
-| Stage              | Durable unit                   |
-| ------------------ | ------------------------------ |
-| Geofabrik download | resumable partial download     |
-| OSM preparation    | prepared local partitions      |
-| Foursquare         | 1° source tile                 |
-| Overture           | 1° source tile                 |
-| Pairwise matching  | 0.25° tile × source pair       |
-| Final clustering   | transactional clustering state |
-
-Version 0.2.1 also binds downstream work to the source snapshot from which it was generated.
-
-This means, for example, that match shards from an older source release are not silently reused after a source refresh.
-
-Completed matching records the expected shard inventory, and finalization verifies that the expected shards are still present and valid before using them.
-
-The principle is simple:
-
-> **Partial, stale, or internally inconsistent state should stop the pipeline rather than quietly become published output.**
-
----
-
-## Entity matching
-
-Matching is performed separately for each pair of sources:
-
-```text
-Foursquare <-> Overture
-Foursquare <-> OpenStreetMap
-Overture   <-> OpenStreetMap
-```
-
-OpenPlaces PH does not perform a national all-pairs comparison.
-
-Candidate generation uses spatial blocking so that only geographically plausible observations are compared.
-
-For each match tile, the pipeline roughly performs:
-
-1. spatially restrict the source observations;
-2. assign observations to small coordinate-grid cells;
-3. compare observations only across neighboring cells;
-4. eliminate impossible pairs using cheap coordinate bounds;
-5. compute exact Haversine distance for surviving candidates;
-6. compare normalized names using Jaro-Winkler similarity;
-7. use category agreement as supporting evidence; and
-8. retain links that satisfy a distance-dependent acceptance threshold.
-
-The default acceptance ladder is:
+Candidate generation uses spatial blocking, exact Haversine distance, normalized
+name similarity, and weak category support. The default acceptance ladder is:
 
 | Distance | Minimum name score |
-| -------: | -----------------: |
-|   0–20 m |               0.70 |
-|  20–50 m |               0.82 |
-|  50–90 m |               0.90 |
-| 90–120 m |               0.94 |
-
-Short or generic labels such as `ATM`, `Bank`, `Shop`, or `Clinic` receive stricter treatment because they are especially prone to false matches in dense environments.
-
-The acceptance rules have both SQL and Python representations and are tested for parity.
-
----
-
-## Clustering
-
-Accepted links are ranked strongest-first and processed by a constrained union-find algorithm.
-
-The central constraint is:
-
-> **A canonical entity may contain at most one observation from each source.**
-
-This prevents nearby establishments from the same provider from being collapsed into one entity through a third source.
-
-For example, two separate Foursquare branches cannot both become members of the same canonical POI.
-
-Three-source entities do not need to contain all three possible direct links.
-
-A cluster may therefore arise as:
-
-```text
-Foursquare <-> Overture <-> OSM
-```
-
-even when no direct Foursquare–OSM link was accepted.
-
-These cases remain visible through fields such as:
-
-```text
-completed_transitively
-cluster_max_pair_distance_m
-```
-
-so downstream users can impose stricter criteria if needed.
-
----
-
-## Provenance
-
-OpenPlaces PH preserves source identity rather than erasing it during canonicalization.
-
-The canonical output retains identifiers and attributes from the contributing datasets, including source-specific licensing and provenance information.
-
-`source_count` records how many source layers contribute to an entity. It should not be interpreted as a probability that the entity is correct.
-
-The pipeline also distinguishes:
-
-```text
-known_independent_source_count
-```
-
-because an Overture record may itself identify Foursquare as an upstream provider.
-
-This adjustment is deliberately conservative. It captures known provenance relationships without claiming statistical independence that cannot be established from the available metadata.
-
----
-
-## Designed for constrained hardware
-
-The pipeline was designed around a modest Windows machine rather than a large server.
-
-The reference design assumes approximately:
-
-* 8 GB RAM;
-* a four-core laptop-class CPU;
-* limited tolerance for large in-memory dataframes; and
-* local disk available for intermediate files and DuckDB spill.
-
-Accordingly:
-
-* nationwide tables are not loaded into Pandas or GeoPandas;
-* joins, filtering, and sorts are delegated to DuckDB;
-* intermediate data are checkpointed as Parquet;
-* matching operates on small spatial partitions;
-* final clustering uses a compact union-find representation; and
-* the pipeline is expected to survive interruption.
-
-The design goal is not maximum throughput. It is to make a national-scale reconciliation pipeline feasible on ordinary hardware.
-
----
-
-## Refreshing source data
-
-To request newer upstream data:
-
-```powershell
-openplaces --scope philippines --refresh-sources --only sources --temp-dir D:\openplaces-temp
-```
-
-A refresh does not mean blindly redownloading everything.
-
-The pipeline records source-release identities and associates normalized source directories, match checkpoints, and final outputs with the snapshots from which they were generated.
-
-When the source snapshot changes, downstream work is invalidated and rebuilt as necessary.
-
----
-
-## Tests
-
-Run the complete suite with:
-
-```powershell
-python -m pytest -q
-```
-
-The test suite covers areas including:
-
-* spatial-blocking recall;
-* SQL versus brute-force candidate generation;
-* distance-threshold parity;
-* name-normalization parity;
-* constrained clustering;
-* deterministic resume behavior;
-* source-release snapshots;
-* interrupted refreshes;
-* incomplete and stale match shards;
-* HTTP range resume and upstream file changes;
-* OSM preparation;
-* Overture normalization and provenance;
-* empty-output cases;
-* GeoParquet metadata; and
-* finalization state integrity.
-
-Compile-time syntax checking can also be run with:
-
-```powershell
-python -m compileall -q src tests run.py
-```
-
----
-
-## Repository structure
-
-```text
-openplaces-ph/
-├── config/
-│   └── areas.yml
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── CODE_WALKTHROUGH.md
-│   ├── DATA_DICTIONARY.md
-│   └── REVIEW-2026-09.md
-├── src/
-│   └── openplaces_ph/
-├── tests/
-├── environment.yml
-├── pyproject.toml
-└── run.py
-```
-
-Useful documentation:
-
-* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — pipeline architecture and design decisions
-* [`docs/CODE_WALKTHROUGH.md`](docs/CODE_WALKTHROUGH.md) — implementation walkthrough
-* [`docs/DATA_DICTIONARY.md`](docs/DATA_DICTIONARY.md) — output schema
-* [`docs/REVIEW-2026-09.md`](docs/REVIEW-2026-09.md) — review of the 0.2.1 state and refresh changes
-* [`DATA_LICENSES.md`](DATA_LICENSES.md) — source-data licensing and attribution
-
----
-
-## Known limitations
-
-OpenPlaces PH is still an evolving research/data-engineering project.
-
-Important current limitations include:
-
-**Non-Latin names.**
-The current normalization pipeline is ASCII-oriented. Records whose names contain no usable Latin letters or digits may not participate correctly in matching and can be dropped from the canonical layer.
-
-**Category harmonization.**
-The three upstream sources use different category systems. `canonical_category` therefore does not yet represent a fully harmonized national taxonomy.
-
-**Canonical-name priority.**
-The preferred display name is selected using a fixed source priority. That choice has not yet been systematically evaluated across Philippine regions or establishment types.
-
-**Kalayaan municipality.**
-The current default Philippines bounding box begins at 116.80°E and therefore does not include the Kalayaan municipality / Pag-asa Island area near 114.3°E.
-
-**National-scale validation.**
-The software has extensive automated tests, including state and resume behavior, but a complete real-source national run remains a separate operational validation step.
-
-These are documented limitations rather than hidden assumptions.
-
----
+|---:|---:|
+| 0-20 m | 0.70 |
+| 20-50 m | 0.82 |
+| 50-90 m | 0.90 |
+| 90-120 m | 0.94 |
+
+Short and generic names receive stricter treatment.
+
+Accepted links are processed strongest-first by constrained union-find. A
+canonical entity may contain at most one observation from each selected source.
+The ranking has stable secondary keys down to upstream source IDs, so equal
+scores do not leave clustering order to chance for the same inputs and
+configuration.
+
+## Installation notes
+
+The reference Conda environment includes the external `osmium` executable used
+for OpenStreetMap source preparation. A plain editable pip install cannot install
+Osmium; install it separately if you use another environment.
 
 ## Data licensing
 
-The **software** in this repository is released under the MIT License.
+The software is MIT licensed. Upstream data retain their own licences and
+attribution requirements. OpenPlaces records those source terms and the
+per-record licence values derived by the pipeline from preserved provenance. It
+does **not** assign one blanket licence to the combined output.
 
-The **source datasets and derived data do not automatically inherit the MIT License**.
+| Source | Upstream licence treatment |
+|---|---|
+| OpenStreetMap | ODbL 1.0 |
+| Overture Maps, Places theme | Multi-license by upstream provider; use preserved provenance and the pipeline-derived per-record values |
+| Foursquare OS Places | Apache 2.0 |
 
-OpenPlaces PH retains source and license information in its outputs where available.
-
-Before redistributing derived data, consult:
-
-[`DATA_LICENSES.md`](DATA_LICENSES.md)
-
-and the current terms of the relevant upstream datasets.
-
----
+Every completed build through the 0.3 task-oriented interface writes
+`ATTRIBUTION.txt`; `openplaces attribution <area>` regenerates it. The file is deliberately cautious: OSM attribution and possible
+ODbL obligations are surfaced, but the software does not make a legal
+conclusion that the entire combined database must use a particular licence.
+See `DATA_LICENSES.md` and verify current upstream terms before publication.
 
 ## Project status
 
-**Current development version: 0.2.1**
+0.3.3 is a usability, source-selection, disk-hygiene, provenance, and validation
+refactor over the tested 0.2.1 core. It deliberately leaves matching calibration
+and clustering logic unchanged.
 
-Version 0.2.1 focuses on making stop/resume and source refresh behavior safe across separate sessions, strengthening checkpoint integrity, and improving reproducibility of downstream outputs.
-
-The project should currently be treated as an auditable data-building pipeline rather than as a finished authoritative registry.
-
-Contributions, reproducibility checks, bug reports, and validation against Philippine ground truth are welcome.
-
----
-
-## License
-
-MIT License for the software.
-
-See [`LICENSE`](LICENSE) for the code license and [`DATA_LICENSES.md`](DATA_LICENSES.md) for data-source licensing and attribution.
+The next data-model change should preserve richer source-native semantic fields
+for downstream PSIC/PCPC/PSCC classification. That change is intentionally
+separate from this refactor.

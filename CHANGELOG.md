@@ -1,3 +1,23 @@
+## 0.3.3
+
+- Add task-oriented build/status/validate/attribution/storage/clean/areas/doctor commands.
+- Preserve the 0.2 flag interface as legacy_cli.py; a bare `legacy` call is refused.
+- Require an explicit target; a bare command cannot start a national run.
+- Make Foursquare optional and move huggingface_hub to an optional extra.
+- Bind matching/finalization to the exact selected source set and source-tile inventory.
+- Use one source-pair ordering and one pair-directory naming function.
+- Record every run in `run.json` with verified Git SHA/dirty state when available.
+- Validate `run.json` against output source membership and warn on dirty builds.
+- Emit cautious `ATTRIBUTION.txt` metadata without assigning one blanket output licence.
+- Inspect output licence columns once and reuse the result for run metadata and attribution.
+- Guard cleanup against paths outside `data/` and unsafe scope names.
+- Resolve the Hugging Face cache from HF_HUB_CACHE/HF_HOME instead of a fixed path.
+- Allow OPENPLACES_ROOT to relocate the working root.
+- Report unknown sources and unknown area keys as messages, not tracebacks.
+- Improve the existing GitHub Actions workflow instead of adding a duplicate workflow.
+- Add functional tests for source subsets and dynamic edge-shard inventories.
+- Keep the tested matching thresholds and constrained clustering algorithm unchanged.
+
 # Changelog
 
 All notable public changes to OpenPlaces PH are documented here.
