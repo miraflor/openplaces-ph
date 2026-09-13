@@ -210,7 +210,6 @@ def main() -> None:
         _status(root, scope, source_tiles, args.source_tile_deg, args.match_tile_deg)
         return
 
-    check_external_tools()
     fsq_dir, overture_dir, osm_dir = _paths(root, scope.slug, args.source_tile_deg)
 
     # A refresh no longer forces rebuilds by itself: matching and finalization
@@ -224,6 +223,8 @@ def main() -> None:
 
     try:
         if args.only in ("all", "sources"):
+            check_external_tools()
+
             print("\n=== SOURCE 1/3: OpenStreetMap ===")
             osm_dir = prepare_osm(
                 root, args.source_tile_deg, temp_dir, args.main_memory,

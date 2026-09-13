@@ -1,4 +1,4 @@
-name: openplaces
+name: openplaces-ph
 channels:
   - conda-forge
 dependencies:
