@@ -1,3 +1,5 @@
+> **0.3.3 note.** The task-oriented CLI now uses commands such as `openplaces build <area>` and `openplaces status <area>`. Older examples below that begin with flags (for example `openplaces --status`) are the preserved 0.2 compatibility interface. The source set is configurable: the zero-auth default is Overture + OSM and Foursquare is optional. Three-source diagrams below describe full-source mode; matching runs only the pairs implied by the selected sources. The source set and effective source-tile inventory are part of checkpoint identity. Completed outputs also carry `run.json` and `ATTRIBUTION.txt`. See `IMPROVEMENTS_V03.md`.
+
 # OpenPlaces PH architecture
 
 OpenPlaces PH is built around one practical constraint:

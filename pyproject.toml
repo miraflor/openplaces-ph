@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openplaces-ph"
-version = "0.2.1"
+version = "0.3.3"
 description = "Open, provenance-aware Philippine places and establishment data built by triangulating multiple open geospatial sources."
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -15,9 +15,11 @@ dependencies = [
     "pyarrow",
     "PyYAML",
     "requests",
-    "huggingface_hub",
     "overturemaps==1.0.1",
 ]
+
+[project.optional-dependencies]
+foursquare = ["huggingface_hub>=0.34"]
 
 [project.scripts]
 openplaces = "openplaces_ph.cli:main"
