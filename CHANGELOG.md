@@ -1,8 +1,22 @@
+# Changelog
+
+All notable public changes to OpenPlaces PH are documented here.
+
 ## 0.3.4
+
+- Remove the temporary 0.2 CLI compatibility layer.
+- Remove `legacy_cli.py` and the `legacy` subcommand.
+- Stop delegating old flag-style commands.
+- Simplify `doctor` to check only the current installation.
+- Update tests and documentation for the single task-oriented CLI.
+- Bump OpenPlaces PH to 0.3.4.
+- Leave matching, clustering, source-selection, checkpoint, and finalization logic unchanged.
+
+## 0.3.3
 
 - Add task-oriented build/status/validate/attribution/storage/clean/areas/doctor commands.
 - Require an explicit target; a bare command cannot start a national run.
-- Make Foursquare optional and move huggingface_hub to an optional extra.
+- Make Foursquare optional and move `huggingface_hub` to an optional extra.
 - Bind matching/finalization to the exact selected source set and source-tile inventory.
 - Use one source-pair ordering and one pair-directory naming function.
 - Record every run in `run.json` with verified Git SHA/dirty state when available.
@@ -10,16 +24,12 @@
 - Emit cautious `ATTRIBUTION.txt` metadata without assigning one blanket output licence.
 - Inspect output licence columns once and reuse the result for run metadata and attribution.
 - Guard cleanup against paths outside `data/` and unsafe scope names.
-- Resolve the Hugging Face cache from HF_HUB_CACHE/HF_HOME instead of a fixed path.
-- Allow OPENPLACES_ROOT to relocate the working root.
+- Resolve the Hugging Face cache from `HF_HUB_CACHE`/`HF_HOME` instead of a fixed path.
+- Allow `OPENPLACES_ROOT` to relocate the working root.
 - Report unknown sources and unknown area keys as messages, not tracebacks.
 - Improve the existing GitHub Actions workflow instead of adding a duplicate workflow.
 - Add functional tests for source subsets and dynamic edge-shard inventories.
 - Keep the tested matching thresholds and constrained clustering algorithm unchanged.
-
-# Changelog
-
-All notable public changes to OpenPlaces PH are documented here.
 
 ## 0.2.1 — stop/resume and refresh correctness
 
