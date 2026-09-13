@@ -3,7 +3,6 @@ from argparse import Namespace
 import pytest
 
 from openplaces_ph.cli import (
-    _delegate_legacy,
     build_parser,
     main,
     resolve_target,
@@ -113,20 +112,27 @@ def test_status_falls_back_to_the_recorded_source_set():
     assert selected_sources(args, fallback=("fsq", "osm")) == ("fsq", "osm")
 
 
-def test_bare_legacy_is_refused():
-    with pytest.raises(SystemExit) as excinfo:
-        _delegate_legacy([])
-    assert "national build" in str(excinfo.value)
-
-
 def test_bare_invocation_prints_help_and_does_not_build(capsys):
     main([])
     out = capsys.readouterr().out
     assert "usage: openplaces" in out
     assert "build" in out
+    assert "legacy" not in out
 
 
-def test_version_is_handled_by_the_new_parser(capsys):
+def test_legacy_subcommand_is_not_available():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["legacy"])
+
+
+def test_old_flag_style_is_not_delegated():
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--areas", "demo", "--only", "sources"])
+    assert excinfo.value.code == 2
+
+
+def test_version_is_handled_by_the_parser(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["--version"])
     assert excinfo.value.code == 0

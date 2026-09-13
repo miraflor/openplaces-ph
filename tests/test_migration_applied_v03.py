@@ -1,12 +1,9 @@
-"""Guard against copying the new files in without applying the migration.
+"""Guard against copying the task-oriented CLI without the core migration.
 
-The 0.3 CLI calls ``prepare_matches(..., sources=...)`` and
-``finalize(..., sources=...)``, and imports ``legacy_cli``. None of those exist
-until ``apply_v03.py`` edits the core modules. Copying only the new files
-produces a package that imports cleanly and then fails at run time, in the
-match stage, after the slow source acquisition has already finished.
-
-These tests turn that into an immediate, readable failure.
+The current CLI calls ``prepare_matches(..., sources=...)`` and
+``finalize(..., sources=...)``. Those source-aware signatures are part of the
+pipeline contract. These tests turn a partial migration into an immediate,
+readable failure instead of a run-time failure after source acquisition.
 """
 
 import inspect
@@ -35,7 +32,7 @@ def test_core_functions_accept_a_source_set(module_name, function_name):
     signature = _signature(module_name, function_name)
     assert "sources" in signature.parameters, (
         f"{module_name}.{function_name} has no 'sources' parameter. "
-        "Run apply_v03.py; the new files were copied without the migration."
+        "The source-aware core migration is incomplete."
     )
 
 
@@ -55,15 +52,3 @@ def test_expected_shards_accepts_pairs():
     if function is None:
         pytest.skip("_expected_shards is private and may have been renamed")
     assert "pairs" in inspect.signature(function).parameters
-
-
-def test_legacy_cli_exists():
-    """A hard failure, not a skip: the CLI imports this module at run time."""
-    import importlib.util
-
-    found = importlib.util.find_spec("openplaces_ph.legacy_cli")
-    assert found is not None, (
-        "openplaces_ph.legacy_cli is missing. apply_v03.py creates it by "
-        "copying the 0.2 cli.py before overwriting cli.py. Every 0.2 flag "
-        "command fails without it."
-    )

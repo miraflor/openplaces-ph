@@ -136,7 +136,7 @@ source membership and with the selected source set.
 
 Checks that only warn, unless `--strict`: coordinates at exactly (0, 0), null
 evidence tier, identical name at an identical rounded location, a missing or
-malformed `run.json` (for legacy outputs), or an output built from a dirty Git
+malformed `run.json` for older outputs, or an output built from a dirty Git
 working tree. A disagreement between `run.json` and the recorded source set is
 a hard failure.
 
@@ -163,23 +163,6 @@ its own flag because it is expensive to rebuild.
 |---|---|
 | `OPENPLACES_ROOT` | Working root for `data/` and `config/`. Defaults to the checkout. |
 | `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME` | Used to locate the Foursquare cache for `storage` and `clean --hf-cache`. |
-
-## Backwards compatibility
-
-The 0.2 flag interface remains available and is preserved in `legacy_cli.py`:
-
-```bash
-openplaces --areas <area> --only sources
-openplaces legacy --areas <area> --status
-```
-
-Delegation to that interface prints a notice on stderr. `openplaces legacy` with
-no arguments is refused, because in 0.2 a bare call started a national build.
-
-The legacy interface retains the 0.2 **all-three-source** behavior. Therefore a
-legacy acquisition still requires the optional Foursquare install and approved
-Hugging Face access (`python -m pip install -e ".[foursquare]"`). The new
-`openplaces build ...` interface is the recommended zero-auth default.
 
 ## Matching model
 
@@ -222,17 +205,17 @@ does **not** assign one blanket licence to the combined output.
 | Overture Maps, Places theme | Multi-license by upstream provider; use preserved provenance and the pipeline-derived per-record values |
 | Foursquare OS Places | Apache 2.0 |
 
-Every completed build through the 0.3 task-oriented interface writes
-`ATTRIBUTION.txt`; `openplaces attribution <area>` regenerates it. The file is deliberately cautious: OSM attribution and possible
+Every completed build writes `ATTRIBUTION.txt`; `openplaces attribution <area>`
+regenerates it. The file is deliberately cautious: OSM attribution and possible
 ODbL obligations are surfaced, but the software does not make a legal
 conclusion that the entire combined database must use a particular licence.
 See `DATA_LICENSES.md` and verify current upstream terms before publication.
 
 ## Project status
 
-0.3.3 is a usability, source-selection, disk-hygiene, provenance, and validation
-refactor over the tested 0.2.1 core. It deliberately leaves matching calibration
-and clustering logic unchanged.
+0.3.4 uses the task-oriented CLI as the only supported command interface.
+It removes the temporary 0.2 compatibility layer while leaving matching,
+clustering, source-selection, checkpoint, and finalization logic unchanged.
 
 The next data-model change should preserve richer source-native semantic fields
 for downstream PSIC/PCPC/PSCC classification. That change is intentionally
