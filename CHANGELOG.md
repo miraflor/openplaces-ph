@@ -1,7 +1,6 @@
-## 0.3.3
+## 0.3.4
 
 - Add task-oriented build/status/validate/attribution/storage/clean/areas/doctor commands.
-- Preserve the 0.2 flag interface as legacy_cli.py; a bare `legacy` call is refused.
 - Require an explicit target; a bare command cannot start a national run.
 - Make Foursquare optional and move huggingface_hub to an optional extra.
 - Bind matching/finalization to the exact selected source set and source-tile inventory.
