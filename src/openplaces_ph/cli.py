@@ -1,7 +1,6 @@
-"""Human-facing CLI for OpenPlaces PH 0.3.3.
+"""Human-facing CLI for OpenPlaces PH 0.3.4.
 
-The old flag-style CLI remains available for backwards compatibility. New
-commands are task-oriented:
+Commands are task-oriented:
 
     openplaces build <area>
     openplaces status <area>
@@ -264,11 +263,6 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check installation and source access.")
     _source_args(doctor)
 
-    legacy = sub.add_parser(
-        "legacy", add_help=False, help="Run the 0.2 flag-style CLI explicitly."
-    )
-    legacy.add_argument("args", nargs=argparse.REMAINDER)
-
     return parser
 
 
@@ -484,7 +478,7 @@ def _run_build(args) -> int:
     print(f"Root: {describe_root()}")
     print(f"Target: {scope.name}")
     print(f"Sources: {display_sources(sources)}")
-    print(f"Source blocks: {len(source_tiles)} at {args.source_tile_deg:g}\u00b0")
+    print(f"Source blocks: {len(source_tiles)} at {args.source_tile_deg:g}°")
     print(f"Matching pairs: {len(source_pairs(sources))}")
     if "overture" not in sources and boundary_release is None:
         print(
@@ -829,17 +823,6 @@ def _run_doctor(args) -> int:
     ok &= config.exists()
 
     try:
-        from . import legacy_cli  # noqa: F401
-
-        print("0.2 compatibility CLI: available")
-    except Exception:
-        print(
-            "0.2 compatibility CLI: MISSING (legacy_cli.py was not created; "
-            "the 0.3 migration was not applied)"
-        )
-        ok = False
-
-    try:
         import duckdb
 
         print(f"DuckDB: {duckdb.__version__}")
@@ -888,48 +871,8 @@ def _run_doctor(args) -> int:
     return 0 if ok else 1
 
 
-def _delegate_legacy(argv: list[str]) -> None:
-    if not argv:
-        raise SystemExit(
-            "The 0.2 compatibility interface needs explicit arguments, for "
-            "example: openplaces legacy --areas <area> --status\n"
-            "A bare invocation is refused because in 0.2 it started a "
-            "national build."
-        )
-    try:
-        from . import legacy_cli
-    except ImportError as exc:
-        raise SystemExit(
-            "legacy_cli.py is missing. The 0.3 migration copies the old cli.py "
-            "to legacy_cli.py; run apply_v03.py, or remove the 0.2 flags from "
-            "this command."
-        ) from exc
-
-    print("Using the 0.2 compatibility interface.", file=sys.stderr)
-    old_argv = sys.argv[:]
-    try:
-        sys.argv = [old_argv[0], *argv]
-        legacy_cli.main()
-    finally:
-        sys.argv = old_argv
-
-
 def main(argv: list[str] | None = None) -> None:
     argsv = list(sys.argv[1:] if argv is None else argv)
-
-    # Every 0.2 flag command still works. Help, --version and a bare call belong
-    # to 0.3, so no invocation can accidentally start the national pipeline.
-    if argsv and argsv[0].startswith("-") and argsv[0] not in (
-        "-h",
-        "--help",
-        "--version",
-    ):
-        _delegate_legacy(argsv)
-        return
-
-    if argsv and argsv[0] == "legacy":
-        _delegate_legacy(argsv[1:])
-        return
 
     parser = build_parser()
     if not argsv:
