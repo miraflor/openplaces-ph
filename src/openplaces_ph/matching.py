@@ -39,6 +39,7 @@ import pyarrow.parquet as pq
 
 from .config import Scope, bbox_sql
 from .db import connect
+from .source_set import ALL_PAIRS, ALL_SOURCES, normalize_sources, pair_dir_name, source_pairs
 from .snapshot import PipelineStateError, discard_dir, source_snapshot
 from .sources import (
     clear_tile_file_caches,
@@ -50,7 +51,7 @@ from .tiles import Tile, bbox_with_halo, child_tiles, intersects, tiles_for_bbox
 from .util import atomic_json, quote_paths, read_json, valid_parquet
 
 EARTH_RADIUS_M = 6_371_008.8
-PAIRS = (("fsq", "overture"), ("fsq", "osm"), ("overture", "osm"))
+PAIRS = ALL_PAIRS
 
 MANIFEST_NAME = "_config.json"
 COMPLETE_NAME = "_COMPLETE.json"
@@ -457,12 +458,16 @@ def _match_block_worker(
     cfg: MatchConfig,
     stop_s: str,
     allowed: frozenset[tuple[int, int]] | None = None,
+    pairs: tuple[tuple[str, str], ...] = PAIRS,
 ) -> None:
     """Process one 1-degree parent block and checkpoint every child/pair."""
     root = Path(root_s)
     fsq_dir, overture_dir, osm_dir = Path(fsq_s), Path(overture_s), Path(osm_s)
     edge_root = root / "data" / "work" / scope.slug / "edges"
     stop_file = Path(stop_s)
+
+    if not pairs:
+        return
 
     con = connect(Path(temp_s) / f"match_{os.getpid()}", memory_limit=memory_limit, threads=1)
     try:
@@ -472,11 +477,11 @@ def _match_block_worker(
             if not any(intersects(core.bbox, b) for b in scope.bboxes):
                 continue
 
-            for a, b in PAIRS:
+            for a, b in pairs:
                 if stop_file.exists():
                     return
 
-                out_dir = edge_root / f"{a}__{b}"
+                out_dir = edge_root / pair_dir_name(a, b)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 target = out_dir / f"{core.key}.parquet"
                 if valid_parquet(target):
@@ -529,12 +534,16 @@ def _expected_shards(
     scope: Scope,
     source_tiles: list[Tile],
     match_tile_deg: float,
+    pairs: tuple[tuple[str, str], ...] = PAIRS,
 ) -> list[Path]:
     shards: list[Path] = []
     for block in source_tiles:
         for core in child_tiles(block, match_tile_deg):
             if any(intersects(core.bbox, b) for b in scope.bboxes):
-                shards.extend(edge_root / f"{a}__{b}" / f"{core.key}.parquet" for a, b in PAIRS)
+                shards.extend(
+                    edge_root / pair_dir_name(a, b) / f"{core.key}.parquet"
+                    for a, b in pairs
+                )
     return shards
 
 
@@ -591,6 +600,7 @@ def prepare_matches(
     temp_dir: Path,
     memory_limit: str,
     cfg: MatchConfig,
+    sources: tuple[str, ...] = ALL_SOURCES,
     *,
     rebuild: bool = False,
 ) -> Path:
@@ -602,7 +612,11 @@ def prepare_matches(
     across sessions.
     """
     clear_tile_file_caches()
-    snapshot = source_snapshot(root, source_tiles, fsq_dir, overture_dir, osm_dir)
+    sources = normalize_sources(sources, default=ALL_SOURCES)
+    pairs = source_pairs(sources)
+    snapshot = source_snapshot(
+        root, source_tiles, fsq_dir, overture_dir, osm_dir, sources
+    )
 
     edge_root = root / "data" / "work" / scope.slug / "edges"
     manifest = edge_root / MANIFEST_NAME
@@ -612,6 +626,8 @@ def prepare_matches(
         match_tile_deg=match_tile_deg,
         sources=snapshot,
     )
+    config_payload["active_sources"] = list(sources)
+    config_payload["source_tiles"] = [tile.key for tile in source_tiles]
 
     if not rebuild:
         previous = read_json(manifest)
@@ -648,7 +664,7 @@ def prepare_matches(
                 _match_block_worker(
                     block, str(root), scope, source_tile_deg, match_tile_deg,
                     str(fsq_dir), str(overture_dir), str(osm_dir), str(temp_dir),
-                    memory_limit, cfg, str(stop_file), allowed,
+                    memory_limit, cfg, str(stop_file), allowed, pairs,
                 )
         except KeyboardInterrupt:
             stop_file.touch()
@@ -660,7 +676,7 @@ def prepare_matches(
                     _match_block_worker, block, str(root), scope,
                     source_tile_deg, match_tile_deg,
                     str(fsq_dir), str(overture_dir), str(osm_dir), str(temp_dir),
-                    memory_limit, cfg, str(stop_file), allowed,
+                    memory_limit, cfg, str(stop_file), allowed, pairs,
                 )
                 for block in source_tiles
             ]
@@ -681,7 +697,9 @@ def prepare_matches(
     # insufficient: a shard can be deleted/corrupted after the marker is
     # written, and an unexpected stale .parquet would be consumed by finalize.
     expected = sorted(
-        set(_expected_shards(edge_root, scope, source_tiles, match_tile_deg)),
+        set(_expected_shards(
+            edge_root, scope, source_tiles, match_tile_deg, pairs
+        )),
         key=lambda p: p.relative_to(edge_root).as_posix(),
     )
     bad = [p for p in expected if not valid_parquet(p)]

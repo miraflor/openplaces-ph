@@ -78,4 +78,4 @@ Every row is a threshold-accepted cross-source link.
 | `canonical_pois` | Number of canonical entities. |
 | `canonical_pois_completed_transitively` | Number of canonical entities with `completed_transitively=true`. |
 | `evidence_tiers` | Counts of canonical rows by `single` / `double` / `triple`. |
-| `sources` | The source snapshot behind these outputs: `fsq_release`, `overture_release`, and `osm` (the OSM tile cache record, including the Geofabrik PBF version). |
+| `sources` | Exact active source set and source snapshot: selected FSQ/Overture releases and/or the OSM tile-cache record. |

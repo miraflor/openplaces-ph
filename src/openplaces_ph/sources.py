@@ -688,6 +688,7 @@ def _overture_worker(
     # uses STAC to select only intersecting source Parquet fragments and streams
     # batches from S3. The explicit release keeps all resumed tiles consistent.
     if not valid_parquet(raw):
+        print(f"[Overture] {tile.key}: downloading {release} ...", flush=True)
         eps = OVERTURE_BBOX_EDGE_EPS_DEG
         download_bbox = (tile.west - eps, tile.south - eps, tile.east + eps, tile.north + eps)
         found = _stream_overture_tile("place", download_bbox, release, raw)
@@ -821,39 +822,55 @@ def prepare_overture(
 # ---------------------------------------------------------------------------
 
 def _discover_fsq_release() -> str:
-    """Find the newest release folder without listing every global Parquet file."""
-    from huggingface_hub import HfApi, get_token
+    """Discover the newest FSQ release with clear auth/access diagnostics."""
+    try:
+        from huggingface_hub import HfApi, get_token
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Foursquare support is optional. Install it with "
+            '`python -m pip install -e ".[foursquare]"`.'
+        ) from exc
 
     if not get_token():
         raise RuntimeError(
-            "Foursquare requires one-time Hugging Face authorization. "
-            "Accept access to foursquare/fsq-os-places, then run: hf auth login"
+            "Foursquare requires Hugging Face authentication and dataset access. "
+            "Accept access to foursquare/fsq-os-places, then run `hf auth login`."
         )
 
     api = HfApi()
     dates: set[str] = set()
-
-    # Non-recursive tree listing is important: recursively enumerating a huge
-    # worldwide Parquet repository is unnecessary overhead on every restart.
-    for item in api.list_repo_tree(
-        repo_id=FSQ_REPO,
-        repo_type="dataset",
-        path_in_repo="release",
-        recursive=False,
-    ):
-        path = getattr(item, "path", "")
-        match = re.search(r"release/dt=(\d{4}-\d{2}-\d{2})/?$", path)
-        if match:
-            dates.add(match.group(1))
-
-    if not dates:
-        # Compatibility fallback for a Hub repository whose directory tree is
-        # not exposed as folders by a future client/server version. This path is
-        # slower because it enumerates filenames, so it is used only if needed.
-        for filename in api.list_repo_files(repo_id=FSQ_REPO, repo_type="dataset"):
-            match = re.search(r"release/dt=(\d{4}-\d{2}-\d{2})/places/parquet/", filename)
+    try:
+        for item in api.list_repo_tree(
+            repo_id=FSQ_REPO,
+            repo_type="dataset",
+            path_in_repo="release",
+            recursive=False,
+        ):
+            path = getattr(item, "path", "")
+            match = re.search(r"release/dt=(\d{4}-\d{2}-\d{2})/?$", path)
             if match:
                 dates.add(match.group(1))
+
+        if not dates:
+            for filename in api.list_repo_files(repo_id=FSQ_REPO, repo_type="dataset"):
+                match = re.search(
+                    r"release/dt=(\d{4}-\d{2}-\d{2})/places/parquet/", filename
+                )
+                if match:
+                    dates.add(match.group(1))
+    except Exception as exc:
+        message = str(exc).lower()
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403) or any(
+            token in message
+            for token in ("gated", "forbidden", "access denied", "requires approval")
+        ):
+            raise RuntimeError(
+                "Hugging Face authentication is present, but this account does not "
+                "currently have approved access to foursquare/fsq-os-places. "
+                "Request/accept dataset access, then rerun `hf auth login` if needed."
+            ) from exc
+        raise
 
     if not dates:
         raise RuntimeError("Could not discover a Foursquare release folder on Hugging Face.")
@@ -916,6 +933,7 @@ def _fsq_worker(
     tmp = target.with_suffix(".parquet.part")
 
     last_error: Exception | None = None
+    print(f"[Foursquare] {tile.key}: querying {release} ...", flush=True)
 
     for attempt in range(1, retries + 1):
         tmp.unlink(missing_ok=True)
@@ -990,6 +1008,11 @@ def _fsq_worker(
                 raise RuntimeError("Foursquare query produced an invalid Parquet tile.")
 
             os.replace(tmp, target)
+            print(
+                f"[Foursquare] {tile.key}: complete "
+                f"({target.stat().st_size / (1024 * 1024):.1f} MiB)",
+                flush=True,
+            )
             return
 
         except Exception as exc:
